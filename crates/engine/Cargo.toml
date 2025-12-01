@@ -1,0 +1,23 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+orderbook = { path = "../orderbook" }
+algo-core = { path = "../algo-core" }
+api = { path = "../api" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

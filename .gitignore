@@ -1,0 +1,93 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+# Note: Cargo.lock should be committed for binary projects
+# Uncomment below if this becomes a library:
+# Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.whl
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Proto generated files
+crates/api/src/proto/*.rs
+
+# Python generated proto
+python/algo_exec_py/*_pb2.py
+python/algo_exec_py/*_pb2_grpc.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test and benchmark outputs
+criterion/
+*.profdata
+*.profraw
+flamegraph*.svg
+perf.data*
+
+# Logs
+*.log
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+secrets.toml
+config.toml
+*.key
+*.pem
+
+# Trading system specific
+orders.json
+trades.json
+backtest_results/
+historical_data/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*~

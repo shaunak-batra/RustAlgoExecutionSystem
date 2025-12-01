@@ -1,0 +1,12 @@
+[package]
+name = "strategies"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+
+indicators = { path = "../indicators" }
+analytics = { path = "../analytics" }
+backtesting = { path = "../backtesting" }

@@ -1,0 +1,25 @@
+# Development dependencies
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.3.0
+
+# Jupyter for research
+jupyter>=1.0.0
+ipython>=8.12.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+
+# Profiling
+line_profiler>=4.0.0
+memory_profiler>=0.61.0
+
+# Linting and formatting
+pylint>=2.17.0
+isort>=5.12.0
+
+# Pre-commit hooks
+pre-commit>=3.3.0

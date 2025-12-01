@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package execution;
+
+service ExecutionService {
+  rpc SubmitParentOrder(ParentOrderRequest) returns (ParentOrderResponse);
+  rpc GetOrderStatus(OrderStatusRequest) returns (OrderStatusResponse);
+  rpc StreamFills(StreamFillsRequest) returns (stream FillEvent);
+  rpc GetPositions(PositionsRequest) returns (PositionsResponse);
+}
+
+message ParentOrderRequest {
+  string symbol = 1;
+  string side = 2;  // "BUY" or "SELL"
+  uint64 quantity = 3;
+  int64 limit_price_ticks = 4;  // Optional; 0 = market
+  uint64 start_time_ns = 5;
+  uint64 end_time_ns = 6;
+  string algo_type = 7;  // "TWAP", "POV", etc.
+  uint32 num_slices = 8;
+}
+
+message ParentOrderResponse {
+  uint64 parent_order_id = 1;
+  string status = 2;  // "ACCEPTED", "REJECTED"
+  string message = 3;
+}
+
+message OrderStatusRequest {
+  uint64 parent_order_id = 1;
+}
+
+message OrderStatusResponse {
+  uint64 parent_order_id = 1;
+  string status = 2;  // "PENDING", "WORKING", "FILLED", "CANCELLED"
+  uint64 filled_qty = 3;
+  double avg_fill_price = 4;
+  repeated ChildOrderStatus children = 5;
+}
+
+message ChildOrderStatus {
+  uint64 child_order_id = 1;
+  string status = 2;
+  uint64 filled_qty = 3;
+}
+
+message StreamFillsRequest {}
+
+message FillEvent {
+  uint64 order_id = 1;
+  uint64 fill_qty = 2;
+  int64 fill_price_ticks = 3;
+  uint64 timestamp_ns = 4;
+}
+
+message PositionsRequest {
+  string symbol = 1;
+}
+
+message PositionsResponse {
+  string symbol = 1;
+  int64 position = 2;
+  double realized_pnl = 3;
+  double unrealized_pnl = 4;
+}

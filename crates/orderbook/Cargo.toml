@@ -1,0 +1,15 @@
+[package]
+name = "orderbook"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "orderbook_bench"
+harness = false
