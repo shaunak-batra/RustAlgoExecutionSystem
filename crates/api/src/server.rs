@@ -178,6 +178,7 @@ impl ExecutionService for ExecutionServiceImpl {
 
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
+        // Spawn a task to forward fill events to the client
         tokio::spawn(async move {
             loop {
                 match fill_rx.recv().await {
@@ -190,14 +191,25 @@ impl ExecutionService for ExecutionServiceImpl {
                         };
 
                         if tx.send(Ok(fill_event)).await.is_err() {
+                            // Client disconnected, gracefully exit
+                            println!("Fill stream closed: client disconnected");
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         eprintln!("Fill stream lagged, skipped {} messages", skipped);
+                        // Notify client about the lag
+                        let error_msg = format!("Fill stream lagged: {} messages skipped", skipped);
+                        if tx.send(Err(Status::data_loss(error_msg))).await.is_err() {
+                            // Client disconnected while sending error, gracefully exit
+                            println!("Fill stream closed: client disconnected during error notification");
+                            break;
+                        }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Broadcast channel closed, gracefully exit
+                        println!("Fill stream closed: engine shut down");
                         break;
                     }
                 }

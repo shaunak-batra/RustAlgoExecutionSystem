@@ -11,6 +11,7 @@ pub struct MarketDataFeed {
     quote_tx: broadcast::Sender<Quote>,
     trade_tx: broadcast::Sender<Trade>,
     snapshot_tx: broadcast::Sender<MarketSnapshot>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl MarketDataFeed {
@@ -18,6 +19,7 @@ impl MarketDataFeed {
         let (quote_tx, _) = broadcast::channel(1000);
         let (trade_tx, _) = broadcast::channel(1000);
         let (snapshot_tx, _) = broadcast::channel(100);
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         Self {
             symbol,
@@ -25,7 +27,13 @@ impl MarketDataFeed {
             quote_tx,
             trade_tx,
             snapshot_tx,
+            shutdown_tx,
         }
+    }
+
+    /// Gracefully shut down the market data feed
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
     }
 
     pub fn subscribe_quotes(&self) -> broadcast::Receiver<Quote> {
@@ -46,6 +54,7 @@ impl MarketDataFeed {
         let quote_tx = self.quote_tx.clone();
         let trade_tx = self.trade_tx.clone();
         let snapshot_tx = self.snapshot_tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
             let mut quote_interval = interval(Duration::from_millis(100));
@@ -59,6 +68,11 @@ impl MarketDataFeed {
 
             loop {
                 tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        println!("Market data feed shutting down gracefully for symbol: {}", symbol);
+                        break;
+                    }
+
                     _ = quote_interval.tick() => {
                         let drift = rng.gen_range(-0.1..0.1);
                         current_price += drift;

@@ -1,7 +1,18 @@
+pub mod replay;
+
 use analytics::{PerformanceAnalyzer, Trade, TradeType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+
+pub use replay::*;
+
+// Constants for default rates
+const DEFAULT_RISK_FREE_RATE: f64 = 0.02;      // 2% annual risk-free rate
+#[allow(dead_code)]
+const DEFAULT_COMMISSION_RATE: f64 = 0.001;   // 0.1% commission per trade
+#[allow(dead_code)]
+const DEFAULT_SLIPPAGE_RATE: f64 = 0.0001;    // 0.01% slippage per trade
 
 #[derive(Debug, Error)]
 pub enum BacktestError {
@@ -208,6 +219,7 @@ pub struct BacktestEngine {
     strategy: Box<dyn Strategy>,
     portfolio: Portfolio,
     analyzer: PerformanceAnalyzer,
+    #[allow(dead_code)]
     commission_rate: f64,
     slippage: f64,
 }
@@ -222,7 +234,7 @@ impl BacktestEngine {
         Self {
             strategy,
             portfolio: Portfolio::new(initial_capital),
-            analyzer: PerformanceAnalyzer::new(initial_capital, 0.02),
+            analyzer: PerformanceAnalyzer::new(initial_capital, DEFAULT_RISK_FREE_RATE),
             commission_rate,
             slippage,
         }
@@ -407,7 +419,7 @@ mod tests {
     #[test]
     fn test_backtest_engine() {
         let strategy = Box::new(SMAStrategy::new("BTC".to_string(), 10, 20));
-        let mut engine = BacktestEngine::new(strategy, 100_000.0, 0.001, 0.0001);
+        let mut engine = BacktestEngine::new(strategy, 100_000.0, DEFAULT_COMMISSION_RATE, DEFAULT_SLIPPAGE_RATE);
 
         let data = generate_test_data(100);
         engine.run(data).unwrap();

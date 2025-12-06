@@ -92,3 +92,6 @@ historical_data/
 *.temp
 *.bak
 *~
+
+# Large media is hosted externally, never committed
+*.mp4

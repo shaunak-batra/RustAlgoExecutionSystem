@@ -1,4 +1,4 @@
-use api::{ParentOrder, ParentOrderStatus, Position};
+use api::{ParentOrder, Position};
 use orderbook::{Fill, Order, OrderId, Quantity, Side};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -110,13 +110,22 @@ impl EngineState {
                     // Increasing long position
                     let total_cost = position.avg_price * position.quantity as f64
                         + fill_price * fill_qty as f64;
-                    position.quantity += fill_qty;
+
+                    // Use checked arithmetic to prevent overflow
+                    let new_qty = position.quantity.checked_add(fill_qty)
+                        .expect("Position quantity overflow on buy - quantity too large");
+
+                    position.quantity = new_qty;
                     position.avg_price = total_cost / position.quantity as f64;
                 } else {
                     // Reducing short position
                     let pnl = (position.avg_price - fill_price) * fill_qty as f64;
                     position.realized_pnl += pnl;
-                    position.quantity += fill_qty;
+
+                    let new_qty = position.quantity.checked_add(fill_qty)
+                        .expect("Position quantity overflow while reducing short");
+
+                    position.quantity = new_qty;
                     if position.quantity == 0 {
                         position.avg_price = 0.0;
                     }
@@ -127,13 +136,21 @@ impl EngineState {
                     // Increasing short position
                     let total_cost = position.avg_price * (-position.quantity) as f64
                         + fill_price * fill_qty as f64;
-                    position.quantity -= fill_qty;
+
+                    let new_qty = position.quantity.checked_sub(fill_qty)
+                        .expect("Position quantity underflow on sell - quantity too large");
+
+                    position.quantity = new_qty;
                     position.avg_price = total_cost / (-position.quantity) as f64;
                 } else {
                     // Reducing long position
                     let pnl = (fill_price - position.avg_price) * fill_qty as f64;
                     position.realized_pnl += pnl;
-                    position.quantity -= fill_qty;
+
+                    let new_qty = position.quantity.checked_sub(fill_qty)
+                        .expect("Position quantity underflow while reducing long");
+
+                    position.quantity = new_qty;
                     if position.quantity == 0 {
                         position.avg_price = 0.0;
                     }
@@ -144,6 +161,18 @@ impl EngineState {
 
     pub fn get_position(&self, symbol: &str) -> Option<&Position> {
         self.positions.get(symbol)
+    }
+
+    /// Get position with calculated unrealized PnL based on current market price
+    pub fn get_position_with_pnl(&self, symbol: &str, current_price: f64) -> Option<Position> {
+        self.positions.get(symbol).map(|pos| {
+            let mut position = pos.clone();
+            // Calculate unrealized PnL
+            // For long positions: (current_price - avg_price) * quantity
+            // For short positions: (avg_price - current_price) * abs(quantity)
+            position.unrealized_pnl = (current_price - position.avg_price) * position.quantity as f64;
+            position
+        })
     }
 
     pub fn add_fill(&mut self, fill: Fill) {

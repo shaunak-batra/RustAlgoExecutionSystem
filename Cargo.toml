@@ -7,6 +7,7 @@ members = [
     "crates/python-bindings",
     "crates/trader-gui",
     "crates/database",
+    "crates/config",
     "crates/market-data",
     "crates/indicators",
     "crates/analytics",
@@ -27,6 +28,7 @@ prost = "0.13"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 
 # Python bindings
 pyo3 = { version = "0.22", features = ["extension-module"] }

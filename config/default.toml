@@ -1,0 +1,155 @@
+# QuantSystem Configuration File
+# This file contains all runtime configuration parameters for the trading system
+
+[engine]
+# Clock tick interval in milliseconds (how often the engine processes events)
+clock_tick_interval_ms = 100
+
+# Maximum number of pending orders in the system
+max_pending_orders = 10000
+
+# Enable smart order routing (Phase 2 feature)
+enable_smart_routing = false
+
+# Number of routing retry attempts before giving up
+routing_retry_attempts = 3
+
+
+[market_data]
+# Market data mode: "websocket" or "rest_api"
+# - websocket: Real-time WebSocket feed (low latency)
+# - rest_api: REST API polling (fallback mode)
+mode = "rest_api"
+
+# WebSocket stream URL for Binance
+websocket_url = "wss://stream.binance.com:9443/ws"
+
+# REST API base URL for Binance
+rest_api_url = "https://api.binance.com"
+
+# Automatically fallback to REST API if WebSocket fails
+fallback_on_ws_failure = true
+
+# Number of WebSocket reconnection attempts before falling back to REST
+ws_reconnect_attempts = 5
+
+# Tick sampling interval in milliseconds (how often to record market data)
+# 10000ms = 10 seconds (reduces storage from 500MB-1GB/day to ~50MB/day)
+tick_sample_interval_ms = 10000
+
+# REST API polling interval in milliseconds
+rest_poll_interval_ms = 2000
+
+# Symbols to subscribe to (lowercase for Binance)
+symbols = ["btcusdt", "ethusdt", "bnbusdt", "adausdt", "solusdt"]
+
+
+[risk]
+# Maximum position size per symbol (in quote currency, e.g., USDT)
+max_position_size = 100000.0
+
+# Maximum total exposure across all symbols
+max_total_exposure = 500000.0
+
+# Stop loss percentage (0.02 = 2%)
+stop_loss_pct = 0.02
+
+# Take profit percentage (0.05 = 5%)
+take_profit_pct = 0.05
+
+# Enable real-time risk checks before order submission
+enable_risk_checks = true
+
+# Maximum daily loss limit (in quote currency)
+max_daily_loss = 10000.0
+
+
+[database]
+# SQLite database file path (relative to project root)
+path = "trading_system.db"
+
+# Enable database persistence (save orders, trades, positions)
+enable_persistence = true
+
+# Enable tick data recording (market data snapshots)
+enable_tick_recording = true
+
+# Auto-vacuum database periodically to reclaim space
+auto_vacuum = true
+
+
+[api]
+# gRPC server host
+host = "127.0.0.1"
+
+# gRPC server port
+port = 50051
+
+# Enable server reflection (allows grpcurl and other tools to introspect)
+enable_reflection = true
+
+# Maximum concurrent gRPC streams
+max_concurrent_streams = 100
+
+
+[gui]
+# Window title
+window_title = "Algorithmic Trading System - QuantSystem"
+
+# Initial window dimensions
+window_width = 1400
+window_height = 900
+
+# Theme: "light" or "dark"
+theme = "dark"
+
+# Chart update interval in milliseconds
+chart_update_interval_ms = 500
+
+# News feed update interval in milliseconds
+news_update_interval_ms = 5000
+
+# Enable keyboard shortcuts (Phase 6 feature)
+enable_keyboard_shortcuts = true
+
+
+[algorithms.twap]
+# Default slice duration in seconds for TWAP algorithm
+# (total order divided into slices of this duration)
+default_slice_duration_secs = 60
+
+# Enable adaptive TWAP (adjust slicing based on volatility)
+enable_adaptive = false
+
+# Volatility calculation window (number of ticks)
+adaptive_volatility_window = 20
+
+
+[algorithms.pov]
+# Default participation rate (0.0 to 1.0)
+# 0.1 = target 10% of market volume
+default_participation_rate = 0.1
+
+# Minimum participation rate
+min_participation_rate = 0.01
+
+# Maximum participation rate
+max_participation_rate = 0.5
+
+
+[algorithms.vwap]
+# Volume profile calculation window in seconds
+# 3600 = 1 hour historical volume profile
+volume_profile_window_secs = 3600
+
+# Enable intraday volume curve modeling
+enable_intraday_curve = true
+
+
+[algorithms.is_algo]
+# Risk aversion parameter (lambda in Almgren-Chriss model)
+# Higher values = more conservative execution
+risk_aversion = 1.0
+
+# Market impact model: "almgren_chriss" or "linear"
+impact_model = "almgren_chriss"

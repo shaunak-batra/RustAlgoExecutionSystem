@@ -1,5 +1,4 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
 use algo_core::twap::{compute_twap_schedule, compute_twap_randomized, TwapParams};
 
 /// Python wrapper for compute_twap_schedule.

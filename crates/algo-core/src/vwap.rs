@@ -1,4 +1,23 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum VwapError {
+    #[error("Number of slices must be greater than zero")]
+    InvalidSliceCount,
+
+    #[error("Total quantity must be greater than zero")]
+    InvalidQuantity,
+
+    #[error("Historical data is empty or insufficient")]
+    InsufficientData,
+
+    #[error("Invalid time range: start={start}, end={end}")]
+    InvalidTimeRange { start: u64, end: u64 },
+
+    #[error("No historical data falls within execution window [{start}, {end}]")]
+    NoDataInWindow { start: u64, end: u64 },
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct VwapParams {
@@ -18,14 +37,38 @@ pub struct VwapOrderInstruction {
 pub fn compute_vwap_schedule(
     params: VwapParams,
     historical_data: &[(u64, f64, u64)],
-) -> Vec<VwapOrderInstruction> {
-    if params.num_slices == 0 || params.total_qty == 0 || historical_data.is_empty() {
-        return Vec::new();
+) -> Result<Vec<VwapOrderInstruction>, VwapError> {
+    // Validate parameters
+    if params.num_slices == 0 {
+        return Err(VwapError::InvalidSliceCount);
+    }
+
+    if params.total_qty == 0 {
+        return Err(VwapError::InvalidQuantity);
+    }
+
+    if historical_data.is_empty() {
+        return Err(VwapError::InsufficientData);
     }
 
     let duration_ns = params.end_ns.saturating_sub(params.start_ns);
-    if duration_ns == 0 {
-        return Vec::new();
+    if duration_ns == 0 || params.end_ns <= params.start_ns {
+        return Err(VwapError::InvalidTimeRange {
+            start: params.start_ns,
+            end: params.end_ns,
+        });
+    }
+
+    // Validate that at least some historical data falls within the execution window
+    let has_data_in_window = historical_data
+        .iter()
+        .any(|(ts, _, _)| *ts >= params.start_ns && *ts < params.end_ns);
+
+    if !has_data_in_window {
+        return Err(VwapError::NoDataInWindow {
+            start: params.start_ns,
+            end: params.end_ns,
+        });
     }
 
     let slice_duration = duration_ns / params.num_slices as u64;
@@ -85,7 +128,7 @@ pub fn compute_vwap_schedule(
         }
     }
 
-    instructions
+    Ok(instructions)
 }
 
 #[cfg(test)]
@@ -107,7 +150,7 @@ mod tests {
             num_slices: 4,
         };
 
-        let schedule = compute_vwap_schedule(params, &historical_data);
+        let schedule = compute_vwap_schedule(params, &historical_data).unwrap();
         assert_eq!(schedule.len(), 4);
 
         let total_qty: u64 = schedule.iter().map(|s| s.qty).sum();
@@ -116,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_vwap_distributes_evenly() {
-        let historical_data = vec![(1000, 100.0, 1000)];
+        let historical_data = vec![(500, 100.0, 1000)];
 
         let params = VwapParams {
             start_ns: 0,
@@ -125,7 +168,7 @@ mod tests {
             num_slices: 10,
         };
 
-        let schedule = compute_vwap_schedule(params, &historical_data);
+        let schedule = compute_vwap_schedule(params, &historical_data).unwrap();
         assert_eq!(schedule.len(), 10);
 
         for instruction in &schedule {
@@ -135,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_vwap_handles_remainder() {
-        let historical_data = vec![(1000, 100.0, 1000)];
+        let historical_data = vec![(500, 100.0, 1000)];
 
         let params = VwapParams {
             start_ns: 0,
@@ -144,7 +187,7 @@ mod tests {
             num_slices: 10,
         };
 
-        let schedule = compute_vwap_schedule(params, &historical_data);
+        let schedule = compute_vwap_schedule(params, &historical_data).unwrap();
         let total_qty: u64 = schedule.iter().map(|s| s.qty).sum();
         assert_eq!(total_qty, 105);
     }

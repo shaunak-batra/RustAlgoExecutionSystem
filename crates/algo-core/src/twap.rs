@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+// Constants
+const JITTER_FRACTION: u64 = 4; // Jitter within ±25% of slice duration (1/4)
+
 /// Parameters for TWAP (Time-Weighted Average Price) execution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TwapParams {
@@ -84,8 +87,8 @@ pub fn compute_twap_randomized(
     params: TwapParams,
     seed: u64,
 ) -> Vec<ChildOrderInstruction> {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
 
     let base_schedule = compute_twap_schedule(params);
 
@@ -101,21 +104,28 @@ pub fn compute_twap_randomized(
         .into_iter()
         .enumerate()
         .map(|(i, mut instr)| {
-            // Simple deterministic pseudo-random jitter using hash
-            let mut hasher = RandomState::new().build_hasher();
+            // Deterministic pseudo-random jitter using DefaultHasher
+            let mut hasher = DefaultHasher::new();
             hasher.write_u64(seed);
             hasher.write_usize(i);
             let random_value = hasher.finish();
 
-            // Jitter within ±25% of slice duration
-            let max_jitter = slice_duration_ns / 4;
-            let jitter = (random_value % (2 * max_jitter)).saturating_sub(max_jitter);
+            // Calculate slice boundaries to keep jitter within the slice
+            let slice_start = params.start_ns + (i as u64 * slice_duration_ns);
+            let slice_end = if i == params.num_slices - 1 {
+                // Last slice extends to end_ns
+                params.end_ns
+            } else {
+                slice_start + slice_duration_ns
+            };
 
-            instr.target_time_ns = instr
-                .target_time_ns
-                .saturating_add(jitter)
-                .max(params.start_ns)
-                .min(params.end_ns);
+            // Jitter within ±25% of slice duration, but clamped to slice boundaries
+            let max_jitter = slice_duration_ns / JITTER_FRACTION;
+            let jitter_offset = (random_value % (2 * max_jitter)).saturating_sub(max_jitter);
+
+            // Apply jitter and clamp to slice boundaries
+            let jittered_time = instr.target_time_ns.wrapping_add(jitter_offset);
+            instr.target_time_ns = jittered_time.max(slice_start).min(slice_end);
 
             instr
         })

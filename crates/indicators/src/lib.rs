@@ -326,7 +326,8 @@ mod tests {
 
     #[test]
     fn test_rsi() {
-        let prices = vec![44.0, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03, 45.61, 46.28, 46.28];
+        // Need at least period+2 prices to get 1 RSI value (period+1 changes, then calculate from period onwards)
+        let prices = vec![44.0, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03, 45.61, 46.28, 46.28, 46.50];
         let result = rsi(&prices, 14).unwrap();
         assert!(result.len() > 0);
         // RSI should be between 0 and 100

@@ -88,7 +88,6 @@ impl OrderBook {
                     match best_ask_price {
                         Some(ask_price) if ask_price <= order.price => {
                             let fill_qty;
-                            let resting_fully_filled;
                             let queue_empty;
 
                             {
@@ -108,8 +107,6 @@ impl OrderBook {
                                     order.qty.0 -= fill_qty.0;
                                     resting_order.qty.0 -= fill_qty.0;
 
-                                    resting_fully_filled = resting_order.qty == Quantity::ZERO;
-
                                     if resting_order.qty > Quantity::ZERO {
                                         ask_queue.push_front(resting_order);
                                     }
@@ -120,10 +117,10 @@ impl OrderBook {
                                 }
                             }
 
-                            // Depth update removed - already maintained via entry().and_modify()
-                            // if resting_fully_filled {
-                            //     self.update_depth(&ask_price, &Side::Sell, false);
-                            // }
+                            // Update depth after fill
+                            self.ask_depth
+                                .entry(ask_price)
+                                .and_modify(|q| *q = q.saturating_sub(fill_qty));
 
                             if queue_empty {
                                 self.asks.remove(&ask_price);
@@ -138,8 +135,8 @@ impl OrderBook {
                             // No more matches or limit price reached
                             if order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK {
                                 // Cancel unfilled portion
-                                if order.tif == TimeInForce::FOK && !fills.is_empty() {
-                                    // FOK not fully filled - reject all
+                                if order.tif == TimeInForce::FOK && order.qty > Quantity::ZERO {
+                                    // FOK not fully filled - reject all (prevent partial fills)
                                     return Vec::new();
                                 }
                                 return fills;
@@ -171,7 +168,6 @@ impl OrderBook {
                     match best_bid_price {
                         Some(bid_price) if bid_price >= order.price => {
                             let fill_qty;
-                            let resting_fully_filled;
                             let queue_empty;
 
                             {
@@ -191,8 +187,6 @@ impl OrderBook {
                                     order.qty.0 -= fill_qty.0;
                                     resting_order.qty.0 -= fill_qty.0;
 
-                                    resting_fully_filled = resting_order.qty == Quantity::ZERO;
-
                                     if resting_order.qty > Quantity::ZERO {
                                         bid_queue.push_front(resting_order);
                                     }
@@ -203,10 +197,10 @@ impl OrderBook {
                                 }
                             }
 
-                            // Depth update removed - already maintained via entry().and_modify()
-                            // if resting_fully_filled {
-                            //     self.update_depth(&bid_price, &Side::Buy, false);
-                            // }
+                            // Update depth after fill
+                            self.bid_depth
+                                .entry(bid_price)
+                                .and_modify(|q| *q = q.saturating_sub(fill_qty));
 
                             if queue_empty {
                                 self.bids.remove(&bid_price);
@@ -220,7 +214,8 @@ impl OrderBook {
                         _ => {
                             // No more matches
                             if order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK {
-                                if order.tif == TimeInForce::FOK && !fills.is_empty() {
+                                if order.tif == TimeInForce::FOK && order.qty > Quantity::ZERO {
+                                    // FOK not fully filled - reject all (prevent partial fills)
                                     return Vec::new();
                                 }
                                 return fills;
@@ -247,6 +242,7 @@ impl OrderBook {
         fills
     }
 
+    #[allow(dead_code)]
     fn update_depth(&mut self, price: &Price, side: &Side, _add: bool) {
         // Placeholder for depth tracking updates
         match side {

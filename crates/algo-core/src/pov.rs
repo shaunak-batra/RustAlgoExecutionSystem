@@ -74,24 +74,25 @@ mod tests {
     #[test]
     fn test_pov_basic() {
         let market_volumes = vec![
-            (1000, 1000),
+            (1000, 500),
             (2000, 500),
-            (3000, 800),
+            (3000, 500),
         ];
 
         let params = PovParams {
             start_ns: 0,
             end_ns: 5000,
-            total_qty: 200,
+            total_qty: 240,
             target_pct: 0.2,
             num_slices: 10,
         };
 
         let schedule = compute_pov_schedule(params, &market_volumes);
+        // 500 * 0.2 = 100 per slice, need 240 total = 3 slices (100 + 100 + 40)
         assert_eq!(schedule.len(), 3);
 
         let total_qty: u64 = schedule.iter().map(|s| s.qty).sum();
-        assert_eq!(total_qty, 200);
+        assert_eq!(total_qty, 240);
     }
 
     #[test]

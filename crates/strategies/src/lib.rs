@@ -1,6 +1,6 @@
 use backtesting::{MarketDataBar, Portfolio, Signal, Strategy};
 use indicators;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 // ============================================================================
 // Pairs Trading Strategy

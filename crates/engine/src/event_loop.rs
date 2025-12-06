@@ -15,6 +15,8 @@ pub struct ExecutionEngine {
     risk_checker: RiskChecker,
     tick_interval_ms: u64,
     fill_tx: broadcast::Sender<Fill>,
+    /// Track which orderbooks have been seeded to prevent double-seeding
+    seeded_orderbooks: HashMap<String, bool>,
 }
 
 impl ExecutionEngine {
@@ -26,6 +28,7 @@ impl ExecutionEngine {
             risk_checker: RiskChecker::new(RiskConfig::default()),
             tick_interval_ms,
             fill_tx,
+            seeded_orderbooks: HashMap::new(),
         }
     }
 
@@ -84,9 +87,49 @@ impl ExecutionEngine {
 
                         EngineCommand::GetPositions { symbol, response_tx } => {
                             let positions = if let Some(sym) = symbol {
-                                self.state.get_position(&sym).cloned().into_iter().collect()
+                                // Get current market price from orderbook
+                                let current_price = self.orderbooks.get(&sym)
+                                    .and_then(|book| {
+                                        // Use mid price if available, otherwise use best bid/ask
+                                        let bid = book.best_bid().map(|p| p.as_f64());
+                                        let ask = book.best_ask().map(|p| p.as_f64());
+                                        match (bid, ask) {
+                                            (Some(b), Some(a)) => Some((b + a) / 2.0),
+                                            (Some(b), None) => Some(b),
+                                            (None, Some(a)) => Some(a),
+                                            (None, None) => None,
+                                        }
+                                    });
+
+                                if let Some(price) = current_price {
+                                    self.state.get_position_with_pnl(&sym, price).into_iter().collect()
+                                } else {
+                                    // No market price available, return position without updated unrealized PnL
+                                    self.state.get_position(&sym).cloned().into_iter().collect()
+                                }
                             } else {
-                                self.state.positions.values().cloned().collect()
+                                // Get all positions with calculated unrealized PnL
+                                self.state.positions.values().map(|pos| {
+                                    let current_price = self.orderbooks.get(&pos.symbol)
+                                        .and_then(|book| {
+                                            let bid = book.best_bid().map(|p| p.as_f64());
+                                            let ask = book.best_ask().map(|p| p.as_f64());
+                                            match (bid, ask) {
+                                                (Some(b), Some(a)) => Some((b + a) / 2.0),
+                                                (Some(b), None) => Some(b),
+                                                (None, Some(a)) => Some(a),
+                                                (None, None) => None,
+                                            }
+                                        });
+
+                                    if let Some(price) = current_price {
+                                        let mut position = pos.clone();
+                                        position.unrealized_pnl = (price - position.avg_price) * position.quantity as f64;
+                                        position
+                                    } else {
+                                        pos.clone()
+                                    }
+                                }).collect()
                             };
                             let _ = response_tx.send(positions);
                         }
@@ -250,12 +293,15 @@ impl ExecutionEngine {
         // Create child orders
         let mut child_order_ids = Vec::new();
 
+        // Check if we need to seed the orderbook (before getting mutable borrow)
+        let needs_seeding = !self.seeded_orderbooks.contains_key(&symbol);
+
         // Get or create orderbook for this symbol
         let orderbook = self.get_or_create_orderbook(&symbol);
 
-        // Seed orderbook with market maker liquidity if empty
-        let mid_price = Price::from_f64(100.0);
-        if orderbook.best_bid().is_none() && orderbook.best_ask().is_none() {
+        // Seed orderbook with market maker liquidity if not already seeded
+        if needs_seeding {
+            let mid_price = Price::from_f64(100.0);
             info!("Seeding orderbook {} with market maker liquidity at price {}", symbol, mid_price.0);
             orderbook.seed_market_maker(mid_price, 10, Quantity::new(10000));
         }
@@ -277,6 +323,11 @@ impl ExecutionEngine {
                 }
             }
         });
+
+        // Mark orderbook as seeded (must be done after we're finished with orderbook)
+        if needs_seeding {
+            self.seeded_orderbooks.insert(symbol.clone(), true);
+        }
 
         for instr in schedule {
             let child_id = self.state.next_child_id();

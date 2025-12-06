@@ -1,7 +1,15 @@
 use crate::state::EngineState;
 use api::ParentOrder;
-use orderbook::{Price, Quantity, Side};
+use orderbook::{Price, Side};
 use thiserror::Error;
+
+// Risk limit constants
+const DEFAULT_MAX_POSITION: u64 = 1_000_000;
+const DEFAULT_MAX_ORDER_SIZE: u64 = 100_000;
+const DEFAULT_MAX_ORDER_NOTIONAL: f64 = 10_000_000.0;
+const DEFAULT_MAX_TOTAL_NOTIONAL: f64 = 50_000_000.0;
+const DEFAULT_MIN_PRICE: f64 = 0.01;
+const DEFAULT_MAX_PRICE: f64 = 1_000_000.0;
 
 /// Risk check errors.
 #[derive(Debug, Error)]
@@ -50,12 +58,12 @@ pub struct RiskConfig {
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
-            max_position: 1_000_000,
-            max_order_notional: 10_000_000.0,
-            max_order_size: 100_000,
-            max_total_notional: 50_000_000.0,
-            min_price: Price::from_f64(0.01),
-            max_price: Price::from_f64(1_000_000.0),
+            max_position: DEFAULT_MAX_POSITION,
+            max_order_notional: DEFAULT_MAX_ORDER_NOTIONAL,
+            max_order_size: DEFAULT_MAX_ORDER_SIZE,
+            max_total_notional: DEFAULT_MAX_TOTAL_NOTIONAL,
+            min_price: Price::from_f64(DEFAULT_MIN_PRICE),
+            max_price: Price::from_f64(DEFAULT_MAX_PRICE),
         }
     }
 }
@@ -145,9 +153,38 @@ impl RiskChecker {
     }
 
     /// Post-trade checks (e.g., after fills)
-    pub fn check_post_trade(&self, _state: &EngineState) -> Result<(), RiskError> {
-        // Placeholder for post-trade checks
-        // Could check realized losses, margin requirements, etc.
+    pub fn check_post_trade(&self, state: &EngineState) -> Result<(), RiskError> {
+        // Check total notional exposure across all positions
+        let total_notional: f64 = state
+            .positions
+            .values()
+            .map(|p| p.avg_price * p.quantity.abs() as f64)
+            .sum();
+
+        if total_notional > self.config.max_total_notional {
+            return Err(RiskError::NotionalLimitExceeded {
+                value: total_notional,
+                limit: self.config.max_total_notional,
+            });
+        }
+
+        // Check individual position limits
+        for (_symbol, position) in &state.positions {
+            if position.quantity.unsigned_abs() > self.config.max_position {
+                return Err(RiskError::PositionLimitExceeded {
+                    current: position.quantity,
+                    limit: self.config.max_position as i64,
+                });
+            }
+
+            // Check for excessive realized losses (circuit breaker)
+            // Halt trading if losses exceed a threshold (e.g., 50% of max notional)
+            let max_loss_threshold = -0.5 * self.config.max_total_notional;
+            if position.realized_pnl < max_loss_threshold {
+                return Err(RiskError::InsufficientCapital);
+            }
+        }
+
         Ok(())
     }
 }
@@ -156,8 +193,7 @@ impl RiskChecker {
 mod tests {
     use super::*;
     use api::{ParentOrderStatus, Position};
-    use orderbook::Timestamp;
-    use std::collections::HashMap;
+    use orderbook::{Quantity, Timestamp};
 
     fn create_test_parent_order(
         symbol: &str,
