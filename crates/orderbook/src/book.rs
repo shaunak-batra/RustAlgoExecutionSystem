@@ -1,6 +1,6 @@
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// An order submitted to the book.
@@ -84,7 +84,8 @@ pub enum OrderOutcome {
     Filled,
     /// A GTC remainder is now resting in the book.
     Resting { remaining: Quantity },
-    /// An IOC or market remainder was cancelled (possibly after partial fills).
+    /// The unfilled remainder of an IOC order (limit or market) was cancelled,
+    /// possibly after partial fills.
     Cancelled { remaining: Quantity },
     /// A FOK order could not trade its full quantity; nothing traded and the
     /// book is unchanged.
@@ -132,9 +133,11 @@ struct Level {
 /// - The best price level fills first; within a level, earlier orders fill first.
 /// - A partially filled resting order keeps its place in the queue.
 ///
-/// Complexity, with `L` price levels on a side and `k` orders at one level:
-/// - [`submit_order`](Self::submit_order): `O(log L)` per price level touched
-///   plus `O(1)` per resting order filled
+/// Complexity, with `L` price levels on a side and `k` orders at one level.
+/// The id index is a hash map, so any bound that touches it is expected and
+/// amortized rather than worst case:
+/// - [`submit_order`](Self::submit_order): `O(log L)` per price level touched,
+///   plus expected amortized `O(1)` per resting order filled or rested
 /// - [`cancel_order`](Self::cancel_order): expected `O(1)` index lookup,
 ///   `O(log L)` level lookup, `O(k)` scan within the level
 /// - [`best_bid`](Self::best_bid) / [`best_ask`](Self::best_ask): `O(log L)`
@@ -166,10 +169,12 @@ impl OrderBook {
     /// Submits an order: matches it against the opposite side, then rests any
     /// GTC remainder at its limit price.
     ///
+    /// The outcome depends only on the time in force; a market order (no limit
+    /// price) follows the same rule as a limit order with the same one:
     /// - `GTC` limit: the unfilled remainder rests.
-    /// - `IOC` and market orders: trade what is available, cancel the rest.
-    /// - `FOK`: trade the full quantity immediately, or nothing (the book is
-    ///   left unchanged).
+    /// - `IOC` (limit or market): trade what is available, cancel the rest.
+    /// - `FOK` (limit or market): trade the full quantity immediately, or
+    ///   nothing (the book is left unchanged).
     ///
     /// Invalid orders return `Err` and leave the book unchanged.
     pub fn submit_order(&mut self, order: Order) -> Result<SubmitResult, OrderError> {
@@ -302,15 +307,20 @@ impl OrderBook {
             .find(|order| order.id == id)
     }
 
-    /// Checks every internal consistency rule of the book in `O(n)`:
-    /// no empty levels, cached level totals match their orders, the id index
-    /// matches the resting orders exactly, resting orders are GTC limit orders
-    /// on the right side and level, and the book is not crossed.
+    /// Checks every internal consistency rule of the book in expected `O(n)`:
+    /// no empty levels, no id resting twice, cached level totals match their
+    /// orders, the id index matches the resting orders exactly, resting orders
+    /// are GTC limit orders on the right side and level, and the book is not
+    /// crossed.
     ///
     /// Intended for tests and debugging; returns a description of the first
     /// violation found.
     pub fn check_invariants(&self) -> Result<(), String> {
         let mut resting = 0usize;
+        // Ids must be unique across the whole book. Without this check a
+        // duplicate id paired with a stale index entry keeps the counts below
+        // matching, so the index comparison would not prove an exact match.
+        let mut seen = HashSet::with_capacity(self.index.len());
         for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
             for (&price, level) in levels {
                 if level.orders.is_empty() {
@@ -326,6 +336,9 @@ impl OrderBook {
                     }
                     if order.tif != TimeInForce::GTC {
                         return Err(format!("{} rests with {:?}", order.id, order.tif));
+                    }
+                    if !seen.insert(order.id) {
+                        return Err(format!("{} rests twice", order.id));
                     }
                     if self.index.get(&order.id) != Some(&(side, price)) {
                         return Err(format!("index entry for {} is missing or stale", order.id));
@@ -898,5 +911,155 @@ mod tests {
             vec![(px(99.0), Quantity(11)), (px(98.0), Quantity(20))]
         );
         assert_eq!(book.ask_levels(1), vec![(px(101.0), Quantity(15))]);
+    }
+
+    #[test]
+    fn top_of_book_is_the_best_of_several_levels() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 98.0, 10));
+        submit(&mut book, limit(2, Side::Buy, 99.0, 10));
+        submit(&mut book, limit(3, Side::Sell, 102.0, 10));
+        submit(&mut book, limit(4, Side::Sell, 101.0, 10));
+
+        assert_eq!(book.best_bid(), Some(px(99.0)), "highest bid wins");
+        assert_eq!(book.best_ask(), Some(px(101.0)), "lowest ask wins");
+        assert_eq!(book.mid(), Some(px(100.0)));
+        assert_eq!(book.spread(), Some(px(2.0)));
+    }
+
+    #[test]
+    fn mid_does_not_overflow_at_extreme_prices() {
+        let mut book = book();
+        let extreme = |id: u64, side: Side, ticks: i64| {
+            Order::limit(OrderId(id), side, Price(ticks), Quantity(1), Timestamp(id))
+        };
+        submit(&mut book, extreme(1, Side::Buy, i64::MAX - 1));
+        submit(&mut book, extreme(2, Side::Sell, i64::MAX));
+
+        // Adding the two prices overflows i64, so the sum is taken in i128.
+        assert_eq!(book.mid(), Some(Price(i64::MAX - 1)));
+        assert_eq!(book.spread(), Some(Price(1)));
+    }
+
+    #[test]
+    fn resting_order_returns_the_order_with_that_id() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 10));
+        submit(&mut book, limit(2, Side::Sell, 100.0, 7));
+
+        // Both orders share a level, so each id must return its own order and
+        // its own quantity, not the front of the queue.
+        let resting = |book: &OrderBook, id: u64| {
+            book.resting_order(OrderId(id))
+                .map(|order| (order.id, order.qty))
+        };
+        assert_eq!(resting(&book, 1), Some((OrderId(1), Quantity(10))));
+        assert_eq!(resting(&book, 2), Some((OrderId(2), Quantity(7))));
+
+        // A partial fill of the front order shows in its remaining quantity,
+        // and leaves the order behind it untouched.
+        submit(&mut book, limit(3, Side::Buy, 100.0, 4));
+        assert_eq!(resting(&book, 1), Some((OrderId(1), Quantity(6))));
+        assert_eq!(resting(&book, 2), Some((OrderId(2), Quantity(7))));
+        assert_eq!(resting(&book, 99), None);
+    }
+
+    #[test]
+    fn contains_order_tracks_resting_orders_on_both_sides() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 99.0, 10));
+        submit(&mut book, limit(2, Side::Sell, 101.0, 10));
+        assert!(book.contains_order(OrderId(1)), "resting bid");
+        assert!(book.contains_order(OrderId(2)), "resting ask");
+        assert!(!book.contains_order(OrderId(3)), "never submitted");
+
+        book.cancel_order(OrderId(1)).expect("order 1 rests");
+        assert!(!book.contains_order(OrderId(1)), "cancelled");
+
+        let taker = submit(&mut book, limit(4, Side::Buy, 101.0, 10));
+        assert_eq!(taker.outcome, OrderOutcome::Filled);
+        assert!(!book.contains_order(OrderId(2)), "fully filled maker");
+        assert!(!book.contains_order(OrderId(4)), "fully filled taker");
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn fok_fills_a_quantity_that_saturates_the_depth_sum() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 10));
+        submit(
+            &mut book,
+            Order::limit(
+                OrderId(2),
+                Side::Sell,
+                px(101.0),
+                Quantity(u64::MAX),
+                Timestamp(2),
+            ),
+        );
+
+        // Summing the two levels overflows u64, so the available quantity is
+        // saturated and capped at the order size instead of wrapping.
+        let fok = Order::limit(
+            OrderId(3),
+            Side::Buy,
+            px(101.0),
+            Quantity(u64::MAX),
+            Timestamp(3),
+        )
+        .with_tif(TimeInForce::FOK);
+        let result = submit(&mut book, fok);
+
+        assert_eq!(result.outcome, OrderOutcome::Filled);
+        assert_eq!(result.filled_qty, Quantity(u64::MAX));
+        // It took all 10 at 100.0 and u64::MAX - 10 at 101.0.
+        assert_eq!(book.ask_levels(10), vec![(px(101.0), Quantity(10))]);
+    }
+
+    #[test]
+    fn check_invariants_detects_corrupted_state() {
+        // Each case corrupts the book through private state, which submit_order
+        // and cancel_order cannot produce, and asserts the violation is caught.
+        let violation = |book: &OrderBook| book.check_invariants().expect_err("must be rejected");
+
+        let mut crossed = book();
+        submit(&mut crossed, limit(1, Side::Sell, 100.0, 5));
+        crossed.rest(limit(2, Side::Buy, 101.0, 5), px(101.0));
+        assert!(violation(&crossed).contains("crossed"));
+
+        let mut stale_total = book();
+        submit(&mut stale_total, limit(1, Side::Buy, 99.0, 5));
+        stale_total.bids.get_mut(&px(99.0)).unwrap().total_qty += 1;
+        assert!(violation(&stale_total).contains("caches"));
+
+        let mut missing_index = book();
+        submit(&mut missing_index, limit(1, Side::Buy, 99.0, 5));
+        missing_index.index.remove(&OrderId(1));
+        assert!(violation(&missing_index).contains("missing or stale"));
+
+        let mut stale_index = book();
+        submit(&mut stale_index, limit(1, Side::Buy, 99.0, 5));
+        stale_index.index.insert(OrderId(1), (Side::Buy, px(98.0)));
+        assert!(violation(&stale_index).contains("missing or stale"));
+
+        // The same id resting at two levels. The index can only point at one of
+        // them, so the order count still matches and only the id check catches it.
+        let mut duplicate = book();
+        submit(&mut duplicate, limit(1, Side::Buy, 99.0, 5));
+        duplicate.rest(limit(1, Side::Buy, 98.0, 5), px(98.0));
+        assert_eq!(duplicate.order_count(), 1);
+        assert!(violation(&duplicate).contains("rests twice"));
+
+        let mut empty_level = book();
+        submit(&mut empty_level, limit(1, Side::Buy, 99.0, 5));
+        empty_level.bids.insert(px(97.0), Level::default());
+        assert!(violation(&empty_level).contains("empty"));
+
+        let mut resting_ioc = book();
+        resting_ioc.rest(
+            limit(1, Side::Buy, 99.0, 5).with_tif(TimeInForce::IOC),
+            px(99.0),
+        );
+        assert!(violation(&resting_ioc).contains("IOC"));
     }
 }

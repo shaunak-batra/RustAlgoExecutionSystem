@@ -30,26 +30,42 @@ impl Price {
         Price(ticks)
     }
 
-    /// Converts a decimal price to the nearest tick.
+    /// Converts a decimal price to ticks by rounding `price * TICK_SCALE`,
+    /// evaluated in `f64`, half away from zero.
     ///
-    /// Rounds instead of truncating: `0.29 * 100_000.0` is `28999.999...` in
-    /// floating point, which truncation would turn into the wrong tick. NaN maps
-    /// to zero and out-of-range values saturate, so use [`Price::try_from_f64`]
-    /// for untrusted input.
+    /// Rounding rather than truncating is what makes ordinary prices exact:
+    /// `0.29 * 100_000.0` is `28999.999999999996` in floating point, which
+    /// truncation would turn into the wrong tick. The result is the nearest tick
+    /// for every price with at most five decimals whose tick count stays below
+    /// `2^53`. Outside that range, or for a price within floating-point error of
+    /// half a tick, the `f64` product decides and the result can be off by a
+    /// tick (by more at very large magnitudes).
+    ///
+    /// NaN maps to zero and out-of-range values saturate, so use
+    /// [`Price::try_from_f64`] for untrusted input.
     #[inline]
     pub fn from_f64(price: f64) -> Self {
         Price((price * Self::TICK_SCALE).round() as i64)
     }
 
-    /// Converts a decimal price to the nearest tick, rejecting NaN, infinities,
-    /// and values outside the `i64` tick range.
+    /// Converts a decimal price to ticks exactly as [`Price::from_f64`] does,
+    /// rejecting NaN, infinities, and prices whose rounded tick count reaches
+    /// either end of the `i64` range.
+    ///
+    /// The bound is exclusive on both sides: `2^63` ticks is one past
+    /// `i64::MAX`, and `-2^63` ticks is rejected too, even though `i64::MIN`
+    /// could hold it. At that magnitude the only `f64` prices whose product
+    /// rounds to exactly `-2^63` are themselves out of range — the nearest
+    /// in-range price rounds to `-9223372036854774784` — so rejecting it
+    /// discards no representable price and keeps the two ends symmetric.
     pub fn try_from_f64(price: f64) -> Result<Self, PriceError> {
         if !price.is_finite() {
             return Err(PriceError::NotFinite(price));
         }
         let ticks = (price * Self::TICK_SCALE).round();
-        // -2^63 is exactly representable; 2^63 is one past i64::MAX.
-        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&ticks) {
+        /// One past `i64::MAX`.
+        const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+        if !(-LIMIT < ticks && ticks < LIMIT) {
             return Err(PriceError::OutOfRange(price));
         }
         Ok(Price(ticks as i64))
@@ -261,7 +277,44 @@ mod tests {
                 cents * 1_000,
                 "price {price}"
             );
+            // try_from_f64 must round identically, and in both signs.
+            assert_eq!(
+                Price::try_from_f64(price),
+                Ok(Price::new(cents * 1_000)),
+                "price {price}"
+            );
+            assert_eq!(
+                Price::try_from_f64(-price),
+                Ok(Price::new(-cents * 1_000)),
+                "price {}",
+                -price
+            );
         }
+    }
+
+    #[test]
+    fn try_from_f64_rejects_both_ends_of_the_tick_range() {
+        // 92_233_720_368_547.77 is the nearest f64 to 2^63 / TICK_SCALE, and its
+        // ticks round to exactly 2^63, one past i64::MAX. Both signs are
+        // rejected, so the range is symmetric.
+        assert!(matches!(
+            Price::try_from_f64(92_233_720_368_547.77),
+            Err(PriceError::OutOfRange(_))
+        ));
+        assert!(matches!(
+            Price::try_from_f64(-92_233_720_368_547.77),
+            Err(PriceError::OutOfRange(_))
+        ));
+
+        // The nearest in-range price converts, in both signs.
+        assert_eq!(
+            Price::try_from_f64(92_233_720_368_547.75),
+            Ok(Price::new(9_223_372_036_854_774_784))
+        );
+        assert_eq!(
+            Price::try_from_f64(-92_233_720_368_547.75),
+            Ok(Price::new(-9_223_372_036_854_774_784))
+        );
     }
 
     #[test]

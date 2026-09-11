@@ -107,69 +107,158 @@ enum Op {
     Cancel(OrderId),
 }
 
-/// Seeded operation stream: 55% passive limit orders within 50 ticks of mid,
-/// 30% cancels of previously submitted ids (some already filled), and 15%
-/// IOC orders that cross up to 5 ticks into the other side.
-fn mixed_workload(n: usize, first_id: u64, seed: u64) -> Vec<Op> {
+/// Resting order count the mixed workload is held at, and the width of the band
+/// around it. The starting book holds exactly `TARGET_RESTING` orders.
+const TARGET_RESTING: usize = 800;
+const BAND: usize = 100;
+
+/// A generated operation stream, with the figures needed to read the result.
+struct Workload {
+    ops: Vec<Op>,
+    resting_at_start: usize,
+    resting_at_end: usize,
+    limits: usize,
+    cancels: usize,
+    iocs: usize,
+    fills: usize,
+}
+
+/// Seeded operation stream, generated against a shadow copy of the starting
+/// book so that every operation is one the book can actually act on:
+/// - passive limit orders within 50 ticks of mid, which never cross;
+/// - cancels of an order that is still resting at that point in the stream;
+/// - 15% IOC orders priced 0 to 2 ticks through the opposite touch, so each one
+///   crosses and trades rather than resting or trading nothing.
+///
+/// The add/cancel choice keeps the resting count inside `TARGET_RESTING ± BAND`.
+/// Without that the book grows as the stream replays, and the per-operation
+/// figure is an average over a book of changing size rather than a steady-state
+/// cost that can be compared between runs.
+///
+/// With seed 7 and 100_000 operations the stream is 48_250 passive limit orders,
+/// 36_830 cancels and 14_920 IOC orders producing 20_956 fills, and the resting
+/// count goes from 800 to 899. [`bench_mixed_workload`] prints these figures and
+/// asserts the start and end sizes stay within `BAND` of each other.
+fn mixed_workload(n: usize, start: &OrderBook, first_id: u64, seed: u64) -> Workload {
     let mut rng = StdRng::seed_from_u64(seed);
+    let mut shadow = start.clone();
+    let resting_at_start = shadow.order_count();
+    // Ids that may still be resting; entries for filled orders are dropped lazily.
+    let mut pool: Vec<OrderId> = (1..first_id).map(OrderId).collect();
     let mut ops = Vec::with_capacity(n);
-    let mut submitted: Vec<OrderId> = Vec::new();
     let mut id = first_id;
+    let (mut limits, mut cancels, mut iocs, mut fills) = (0, 0, 0, 0);
 
     while ops.len() < n {
-        let roll = rng.gen_range(0..100);
         let side = if rng.gen_bool(0.5) {
             Side::Buy
         } else {
             Side::Sell
         };
         let qty = Quantity(rng.gen_range(1..=100));
+        let roll = rng.gen_range(0..100);
+        let resting = shadow.order_count();
+        let mut emitted = false;
 
-        if roll < 55 {
+        if roll >= 85 {
+            // Price through the opposite touch so the order always trades.
+            let through = rng.gen_range(0..=2);
+            let limit = match side {
+                Side::Buy => shadow.best_ask().map(|ask| ask.ticks() + through),
+                Side::Sell => shadow.best_bid().map(|bid| bid.ticks() - through),
+            };
+            if let Some(ticks) = limit {
+                let order = Order::limit(OrderId(id), side, Price(ticks), qty, Timestamp(id))
+                    .with_tif(TimeInForce::IOC);
+                id += 1;
+                let result = shadow.submit_order(order).expect("valid order");
+                assert!(
+                    !result.fills.is_empty(),
+                    "an IOC through the touch must trade"
+                );
+                fills += result.fills.len();
+                ops.push(Op::Submit(order));
+                iocs += 1;
+                emitted = true;
+            }
+        } else if resting >= TARGET_RESTING + BAND
+            || (resting > TARGET_RESTING - BAND && roll >= 55)
+        {
+            while !pool.is_empty() {
+                let pick = rng.gen_range(0..pool.len());
+                let candidate = pool.swap_remove(pick);
+                if shadow.contains_order(candidate) {
+                    shadow.cancel_order(candidate).expect("order rests");
+                    ops.push(Op::Cancel(candidate));
+                    cancels += 1;
+                    emitted = true;
+                    break;
+                }
+            }
+        }
+
+        // A passive limit order, and the fallback when there was nothing to take
+        // or nothing left to cancel.
+        if !emitted {
             let offset = rng.gen_range(1..=50);
-            let price = match side {
+            let ticks = match side {
                 Side::Buy => MID - offset,
                 Side::Sell => MID + offset,
             };
-            ops.push(Op::Submit(Order::limit(
-                OrderId(id),
-                side,
-                Price(price),
-                qty,
-                Timestamp(id),
-            )));
-            submitted.push(OrderId(id));
+            let order = Order::limit(OrderId(id), side, Price(ticks), qty, Timestamp(id));
             id += 1;
-        } else if roll < 85 && !submitted.is_empty() {
-            let pick = rng.gen_range(0..submitted.len());
-            ops.push(Op::Cancel(submitted.swap_remove(pick)));
-        } else {
-            let price = match side {
-                Side::Buy => MID + 5,
-                Side::Sell => MID - 5,
-            };
-            let order = Order::limit(OrderId(id), side, Price(price), qty, Timestamp(id))
-                .with_tif(TimeInForce::IOC);
+            let result = shadow.submit_order(order).expect("valid order");
+            assert!(result.fills.is_empty(), "a passive order must not cross");
+            pool.push(order.id);
             ops.push(Op::Submit(order));
-            id += 1;
+            limits += 1;
         }
     }
-    ops
+
+    Workload {
+        ops,
+        resting_at_start,
+        resting_at_end: shadow.order_count(),
+        limits,
+        cancels,
+        iocs,
+        fills,
+    }
 }
 
 fn bench_mixed_workload(c: &mut Criterion) {
     const OPS: usize = 100_000;
     let (start, first_id) = book_with_depth(100);
-    let ops = mixed_workload(OPS, first_id, 7);
+    let workload = mixed_workload(OPS, &start, first_id, 7);
 
+    // If the book does not end near the size it started at, the throughput
+    // figure below describes a book that grew rather than a steady state.
+    assert!(
+        workload.resting_at_end.abs_diff(workload.resting_at_start) <= BAND,
+        "not a steady state: {} resting orders at the start, {} at the end",
+        workload.resting_at_start,
+        workload.resting_at_end
+    );
+    println!(
+        "mixed workload: {} limit, {} cancel, {} IOC ({} fills); \
+         resting {} -> {}",
+        workload.limits,
+        workload.cancels,
+        workload.iocs,
+        workload.fills,
+        workload.resting_at_start,
+        workload.resting_at_end
+    );
+
+    let ops = &workload.ops;
     let mut group = c.benchmark_group("mixed_workload");
     group.throughput(Throughput::Elements(OPS as u64));
     group.sample_size(20);
-    group.bench_function("100k_ops_55limit_30cancel_15ioc", |b| {
+    group.bench_function("100k_ops_steady_state", |b| {
         b.iter_batched(
             || start.clone(),
             |mut book| {
-                for op in &ops {
+                for op in ops {
                     match *op {
                         Op::Submit(order) => {
                             black_box(book.submit_order(order).expect("valid order"));
