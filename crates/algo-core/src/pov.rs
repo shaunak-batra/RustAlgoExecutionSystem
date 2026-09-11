@@ -1,109 +1,263 @@
+//! Percentage-of-volume (POV) schedules.
+
+use crate::schedule::{ChildOrderInstruction, ScheduleError};
 use serde::{Deserialize, Serialize};
 
-/// Parameters for POV (Percent-of-Volume) execution.
-/// POV aims to execute a target percentage of market volume.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Basis points in 100%.
+pub const BPS_PER_UNIT: u32 = 10_000;
+
+/// Parameters for a POV schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PovParams {
-    /// Start time in nanoseconds since epoch
+    /// Window start (nanoseconds). Earlier observations are ignored.
     pub start_ns: u64,
-    /// End time in nanoseconds since epoch
+    /// Window end, exclusive (nanoseconds). Later observations are ignored.
     pub end_ns: u64,
-    /// Total quantity to execute
     pub total_qty: u64,
-    /// Target percentage of volume (0.0 to 1.0)
-    pub target_pct: f64,
-    /// Maximum number of slices
-    pub num_slices: usize,
+    /// Participation rate in basis points of observed volume, 1 to 10 000.
+    pub participation_bps: u32,
 }
 
-/// POV child order instruction.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct PovOrderInstruction {
-    /// Target execution time in nanoseconds
-    pub target_time_ns: u64,
-    /// Quantity for this child order (dynamically calculated)
-    pub qty: u64,
-    /// Observed market volume at this point
-    pub market_volume: u64,
+/// Output of [`compute_pov_schedule`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PovSchedule {
+    /// At most one child per observation timestamp, in time order.
+    pub children: Vec<ChildOrderInstruction>,
+    /// Sum of the children's quantities.
+    pub scheduled_qty: u64,
+    /// `total_qty - scheduled_qty`: quantity the observed volume did not allow.
+    pub shortfall_qty: u64,
 }
 
+/// Trades a fixed share of observed market volume, releasing a child order only
+/// after the volume it is based on has printed (no look-ahead).
+///
+/// `market_volume` holds `(timestamp_ns, volume)` observations in time order,
+/// where `volume` traded by `timestamp_ns`. After each observation in
+/// `[start_ns, end_ns)` the cumulative target is
+/// `min(total_qty, ⌊cumulative volume × participation_bps / 10 000⌋)`, and a
+/// child order for any increase is released at that observation's timestamp.
+/// The arithmetic is exact integer arithmetic, so the cumulative scheduled
+/// quantity never exceeds the rate times cumulative volume.
+///
+/// The rate applies to whatever volume is passed in: pass total market volume
+/// (including this order's own fills) to target that share of all trading, or
+/// volume excluding own fills to trade at that ratio to other participants.
+///
+/// # Examples
+/// ```
+/// use algo_core::pov::{compute_pov_schedule, PovParams};
+///
+/// // 10% of volume, observed in three prints.
+/// let params = PovParams { start_ns: 0, end_ns: 10, total_qty: 1_000, participation_bps: 1_000 };
+/// let schedule = compute_pov_schedule(params, &[(1, 105), (2, 105), (3, 90)]).unwrap();
+///
+/// let quantities: Vec<u64> = schedule.children.iter().map(|child| child.qty).collect();
+/// assert_eq!(quantities, vec![10, 11, 9]);
+/// assert_eq!(schedule.shortfall_qty, 970);
+/// ```
 pub fn compute_pov_schedule(
     params: PovParams,
-    market_volumes: &[(u64, u64)],
-) -> Vec<PovOrderInstruction> {
-    if params.num_slices == 0 || params.total_qty == 0 || market_volumes.is_empty() {
-        return Vec::new();
+    market_volume: &[(u64, u64)],
+) -> Result<PovSchedule, ScheduleError> {
+    if params.total_qty == 0 {
+        return Err(ScheduleError::ZeroQuantity);
+    }
+    if params.end_ns <= params.start_ns {
+        return Err(ScheduleError::InvalidTimeRange {
+            start_ns: params.start_ns,
+            end_ns: params.end_ns,
+        });
+    }
+    if params.participation_bps == 0 || params.participation_bps > BPS_PER_UNIT {
+        return Err(ScheduleError::InvalidParameter {
+            name: "participation_bps",
+            reason: "must be between 1 and 10000",
+        });
+    }
+    if let Some(index) = market_volume
+        .windows(2)
+        .position(|pair| pair[1].0 < pair[0].0)
+    {
+        return Err(ScheduleError::UnsortedMarketData { index: index + 1 });
     }
 
-    let mut instructions = Vec::new();
-    let mut remaining_qty = params.total_qty;
+    let total = u128::from(params.total_qty);
+    let rate = u128::from(params.participation_bps);
+    let mut cumulative_volume = 0u128;
+    let mut scheduled = 0u128;
+    let mut children: Vec<ChildOrderInstruction> = Vec::new();
 
-    for (timestamp_ns, market_vol) in market_volumes {
-        if *timestamp_ns < params.start_ns {
+    for &(timestamp_ns, volume) in market_volume {
+        if timestamp_ns < params.start_ns {
             continue;
         }
-        if *timestamp_ns > params.end_ns {
+        if timestamp_ns >= params.end_ns || scheduled == total {
             break;
         }
-
-        let target_qty = ((*market_vol as f64) * params.target_pct).round() as u64;
-        let qty = target_qty.min(remaining_qty);
-
-        if qty > 0 {
-            instructions.push(PovOrderInstruction {
-                target_time_ns: *timestamp_ns,
-                qty,
-                market_volume: *market_vol,
-            });
-
-            remaining_qty = remaining_qty.saturating_sub(qty);
-        }
-
-        if remaining_qty == 0 {
-            break;
+        cumulative_volume += u128::from(volume);
+        let target = (cumulative_volume * rate / u128::from(BPS_PER_UNIT)).min(total);
+        if target > scheduled {
+            // The increase is at most total_qty, so it fits in u64.
+            let qty = (target - scheduled) as u64;
+            match children.last_mut() {
+                Some(last) if last.target_time_ns == timestamp_ns => last.qty += qty,
+                _ => children.push(ChildOrderInstruction {
+                    target_time_ns: timestamp_ns,
+                    qty,
+                }),
+            }
+            scheduled = target;
         }
     }
 
-    instructions
+    let scheduled_qty = scheduled as u64;
+    Ok(PovSchedule {
+        children,
+        scheduled_qty,
+        shortfall_qty: params.total_qty - scheduled_qty,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    #[test]
-    fn test_pov_basic() {
-        let market_volumes = vec![(1000, 500), (2000, 500), (3000, 500)];
-
-        let params = PovParams {
+    fn params(total_qty: u64, participation_bps: u32) -> PovParams {
+        PovParams {
             start_ns: 0,
-            end_ns: 5000,
-            total_qty: 240,
-            target_pct: 0.2,
-            num_slices: 10,
-        };
+            end_ns: 1_000,
+            total_qty,
+            participation_bps,
+        }
+    }
 
-        let schedule = compute_pov_schedule(params, &market_volumes);
-        // 500 * 0.2 = 100 per slice, need 240 total = 3 slices (100 + 100 + 40)
-        assert_eq!(schedule.len(), 3);
-
-        let total_qty: u64 = schedule.iter().map(|s| s.qty).sum();
-        assert_eq!(total_qty, 240);
+    fn pairs(schedule: &PovSchedule) -> Vec<(u64, u64)> {
+        schedule
+            .children
+            .iter()
+            .map(|child| (child.target_time_ns, child.qty))
+            .collect()
     }
 
     #[test]
-    fn test_pov_respects_target_pct() {
-        let market_volumes = vec![(1000, 1000)];
+    fn participation_is_rounded_down() {
+        let schedule =
+            compute_pov_schedule(params(1_000, 1_000), &[(1, 105), (2, 105), (3, 90)]).unwrap();
+        assert_eq!(pairs(&schedule), vec![(1, 10), (2, 11), (3, 9)]);
+        assert_eq!(schedule.scheduled_qty, 30);
+        assert_eq!(schedule.shortfall_qty, 970);
+    }
 
-        let params = PovParams {
-            start_ns: 0,
-            end_ns: 5000,
-            total_qty: 500,
-            target_pct: 0.1,
-            num_slices: 10,
+    #[test]
+    fn stops_once_the_order_is_complete() {
+        let data = [(1, 20), (2, 20), (3, 20), (4, 20)];
+        let schedule = compute_pov_schedule(params(25, 5_000), &data).unwrap();
+        assert_eq!(pairs(&schedule), vec![(1, 10), (2, 10), (3, 5)]);
+        assert_eq!(schedule.shortfall_qty, 0);
+    }
+
+    #[test]
+    fn only_volume_inside_the_window_counts() {
+        let p = PovParams {
+            start_ns: 10,
+            end_ns: 20,
+            total_qty: 1_000,
+            participation_bps: 10_000,
         };
+        let schedule = compute_pov_schedule(p, &[(5, 100), (10, 7), (19, 3), (20, 100)]).unwrap();
+        assert_eq!(pairs(&schedule), vec![(10, 7), (19, 3)]);
+    }
 
-        let schedule = compute_pov_schedule(params, &market_volumes);
-        assert_eq!(schedule[0].qty, 100);
+    #[test]
+    fn observations_at_the_same_time_share_one_child() {
+        let data = [(1, 10), (1, 10), (2, 10)];
+        let schedule = compute_pov_schedule(params(1_000, 5_000), &data).unwrap();
+        assert_eq!(pairs(&schedule), vec![(1, 10), (2, 5)]);
+    }
+
+    #[test]
+    fn no_volume_means_full_shortfall() {
+        let schedule = compute_pov_schedule(params(10, 100), &[]).unwrap();
+        assert!(schedule.children.is_empty());
+        assert_eq!(schedule.shortfall_qty, 10);
+    }
+
+    #[test]
+    fn invalid_input_is_rejected() {
+        assert_eq!(
+            compute_pov_schedule(params(0, 100), &[]),
+            Err(ScheduleError::ZeroQuantity)
+        );
+        assert!(matches!(
+            compute_pov_schedule(params(10, 0), &[]),
+            Err(ScheduleError::InvalidParameter {
+                name: "participation_bps",
+                ..
+            })
+        ));
+        assert!(matches!(
+            compute_pov_schedule(params(10, 10_001), &[]),
+            Err(ScheduleError::InvalidParameter {
+                name: "participation_bps",
+                ..
+            })
+        ));
+        let empty_window = PovParams {
+            start_ns: 5,
+            end_ns: 5,
+            total_qty: 10,
+            participation_bps: 100,
+        };
+        assert!(matches!(
+            compute_pov_schedule(empty_window, &[]),
+            Err(ScheduleError::InvalidTimeRange { .. })
+        ));
+        // Out-of-order data is rejected even when it lies outside the window.
+        assert_eq!(
+            compute_pov_schedule(params(10, 100), &[(2_000, 1), (1_500, 1)]),
+            Err(ScheduleError::UnsortedMarketData { index: 1 })
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn cap_completeness_and_causality(
+            total_qty in 1u64..1_000_000_000,
+            participation_bps in 1u32..=10_000,
+            volumes in prop::collection::vec(0u64..1_000_000_000, 0..60),
+        ) {
+            let data: Vec<(u64, u64)> = volumes.iter().enumerate().map(|(i, &v)| (i as u64, v)).collect();
+            let p = PovParams { start_ns: 0, end_ns: 1_000, total_qty, participation_bps };
+            let full = compute_pov_schedule(p, &data).unwrap();
+
+            // Cap: the schedule is never ahead of rate x cumulative volume.
+            let mut cumulative_volume = 0u128;
+            let mut done = 0u128;
+            let mut children = full.children.iter().peekable();
+            for &(t, v) in &data {
+                cumulative_volume += u128::from(v);
+                if children.peek().is_some_and(|c| c.target_time_ns == t) {
+                    done += u128::from(children.next().unwrap().qty);
+                }
+                prop_assert!(done * 10_000 <= cumulative_volume * u128::from(participation_bps));
+            }
+
+            // Completeness: it schedules everything the cap allows.
+            let allowed = (cumulative_volume * u128::from(participation_bps) / 10_000)
+                .min(u128::from(total_qty));
+            prop_assert_eq!(u128::from(full.scheduled_qty), allowed);
+            prop_assert_eq!(full.scheduled_qty + full.shortfall_qty, total_qty);
+
+            // Causality: data that arrives later never changes earlier children.
+            for cut in 0..=data.len() {
+                let prefix = compute_pov_schedule(p, &data[..cut]).unwrap();
+                let expected: Vec<_> = full.children.iter().copied()
+                    .filter(|c| c.target_time_ns < cut as u64)
+                    .collect();
+                prop_assert_eq!(prefix.children, expected);
+            }
+        }
     }
 }

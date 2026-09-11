@@ -1,24 +1,32 @@
-"""Backtest engine using Rust FFI bindings for TWAP execution."""
+"""Execution backtest harness: fills schedule child orders at prices from a price path."""
 
-from typing import List, Optional, Tuple, Dict, Any
-import bisect
+from bisect import bisect_left
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from algo_exec_py import compute_twap_py, compute_twap_randomized_py
+from algo_exec_py import twap_schedule, twap_schedule_randomized
 
 
 class BacktestEngine:
-    """Backtest engine that simulates TWAP execution using FFI."""
+    """Replays a TWAP schedule against a recorded price path.
 
-    def __init__(self, price_path: List[Tuple[int, float]]):
+    Each child order fills in full at the price linearly interpolated at its
+    target time (clamped to the first or last observation outside the path).
+    This is a no-impact, no-latency baseline: it measures how a schedule's
+    timing interacts with price moves, not the market impact of trading.
+    """
+
+    def __init__(self, price_path: Sequence[Tuple[int, float]]):
         """
-        Initialize the backtest engine.
-
         Args:
-            price_path: List of (timestamp_ns, price) tuples representing market prices
+            price_path: ``(timestamp_ns, price)`` observations, in any order.
         """
-        self.price_path = sorted(price_path, key=lambda x: x[0])
+        if not price_path:
+            raise ValueError("price_path must not be empty")
+        self.price_path = sorted(price_path, key=lambda point: point[0])
+        self._times = [time_ns for time_ns, _ in self.price_path]
         self.fills: List[Dict[str, Any]] = []
-        self.slippage_bps: List[float] = []
+        self.side = "BUY"
+        self.arrival_price: Optional[float] = None
 
     def run_twap(
         self,
@@ -28,43 +36,9 @@ class BacktestEngine:
         num_slices: int,
         side: str = "BUY",
     ) -> List[Dict[str, Any]]:
-        """
-        Run a TWAP execution simulation.
-
-        Args:
-            start_ns: Start time in nanoseconds
-            end_ns: End time in nanoseconds
-            total_qty: Total quantity to execute
-            num_slices: Number of child orders
-            side: "BUY" or "SELL"
-
-        Returns:
-            List of fill dictionaries
-        """
-        # Compute TWAP schedule using Rust FFI
-        schedule = compute_twap_py(start_ns, end_ns, total_qty, num_slices)
-
-        self.fills = []
-
-        for target_time_ns, qty in schedule:
-            # Simulate fill at target time using interpolated price
-            fill_price = self._interpolate_price(target_time_ns)
-
-            if fill_price is None:
-                print(f"Warning: No price data available at time {target_time_ns}")
-                continue
-
-            fill = {
-                "time_ns": target_time_ns,
-                "qty": qty,
-                "price": fill_price,
-                "side": side,
-                "notional": qty * fill_price,
-            }
-
-            self.fills.append(fill)
-
-        return self.fills
+        """Fill a TWAP schedule and return the fills."""
+        schedule = twap_schedule(start_ns, end_ns, total_qty, num_slices)
+        return self._fill(schedule, start_ns, side)
 
     def run_twap_randomized(
         self,
@@ -75,148 +49,82 @@ class BacktestEngine:
         seed: int = 42,
         side: str = "BUY",
     ) -> List[Dict[str, Any]]:
-        """
-        Run a TWAP execution with randomized timing (jitter).
+        """Fill a TWAP schedule whose release times are randomized within each slice."""
+        schedule = twap_schedule_randomized(start_ns, end_ns, total_qty, num_slices, seed)
+        return self._fill(schedule, start_ns, side)
 
-        Args:
-            start_ns: Start time in nanoseconds
-            end_ns: End time in nanoseconds
-            total_qty: Total quantity to execute
-            num_slices: Number of child orders
-            seed: Random seed for reproducibility
-            side: "BUY" or "SELL"
-
-        Returns:
-            List of fill dictionaries
-        """
-        # Compute randomized TWAP schedule using Rust FFI
-        schedule = compute_twap_randomized_py(start_ns, end_ns, total_qty, num_slices, seed)
-
-        self.fills = []
-
-        for target_time_ns, qty in schedule:
-            fill_price = self._interpolate_price(target_time_ns)
-
-            if fill_price is None:
-                continue
-
-            fill = {
-                "time_ns": target_time_ns,
-                "qty": qty,
-                "price": fill_price,
-                "side": side,
-                "notional": qty * fill_price,
-            }
-
-            self.fills.append(fill)
-
-        return self.fills
-
-    def _interpolate_price(self, target_ns: int) -> Optional[float]:
-        """
-        Interpolate price at target time from price path.
-
-        Args:
-            target_ns: Target timestamp in nanoseconds
-
-        Returns:
-            Interpolated price or None if out of bounds
-        """
-        if not self.price_path:
-            return None
-
-        # Binary search for surrounding points
-        idx = bisect.bisect_left(self.price_path, (target_ns, 0.0))
-
-        # Handle edge cases
+    def price_at(self, time_ns: int) -> float:
+        """Price linearly interpolated at ``time_ns``, clamped to the path's end points."""
+        idx = bisect_left(self._times, time_ns)
         if idx == 0:
             return self.price_path[0][1]
-        if idx >= len(self.price_path):
+        if idx == len(self.price_path):
             return self.price_path[-1][1]
-
-        # Linear interpolation
+        # _times[idx - 1] < time_ns <= _times[idx], so the denominator is positive.
         t0, p0 = self.price_path[idx - 1]
         t1, p1 = self.price_path[idx]
-
-        if t1 == t0:
-            return p0
-
-        alpha = (target_ns - t0) / (t1 - t0)
-        return p0 + alpha * (p1 - p0)
+        return p0 + (time_ns - t0) / (t1 - t0) * (p1 - p0)
 
     def calculate_metrics(self) -> Dict[str, float]:
-        """
-        Calculate execution quality metrics.
+        """Execution quality of the last run.
 
-        Returns:
-            Dictionary with metrics like VWAP, total notional, etc.
+        ``shortfall_bps`` is the cost against the arrival price (the price at the
+        schedule start). It is positive when execution was worse than arrival:
+        above it for a buy, below it for a sell.
         """
-        if not self.fills:
+        if not self.fills or self.arrival_price is None:
             return {}
 
-        total_qty = sum(f["qty"] for f in self.fills)
-        total_notional = sum(f["notional"] for f in self.fills)
-        vwap = total_notional / total_qty if total_qty > 0 else 0.0
-
-        arrival_price = self.price_path[0][1] if self.price_path else 0.0
-        slippage_bps = ((vwap - arrival_price) / arrival_price * 10_000) if arrival_price > 0 else 0.0
+        total_qty = sum(fill["qty"] for fill in self.fills)
+        total_notional = sum(fill["notional"] for fill in self.fills)
+        vwap = total_notional / total_qty
+        direction = 1.0 if self.side == "BUY" else -1.0
+        shortfall_bps = (
+            direction * (vwap - self.arrival_price) / self.arrival_price * 10_000
+            if self.arrival_price > 0
+            else float("nan")
+        )
 
         return {
             "total_qty": total_qty,
             "total_notional": total_notional,
             "vwap": vwap,
-            "arrival_price": arrival_price,
-            "slippage_bps": slippage_bps,
+            "arrival_price": self.arrival_price,
+            "shortfall_bps": shortfall_bps,
             "num_fills": len(self.fills),
         }
 
+    def _fill(
+        self, schedule: List[Tuple[int, int]], start_ns: int, side: str
+    ) -> List[Dict[str, Any]]:
+        if side not in ("BUY", "SELL"):
+            raise ValueError("side must be 'BUY' or 'SELL'")
+        self.side = side
+        self.arrival_price = self.price_at(start_ns)
+        self.fills = []
+        for time_ns, qty in schedule:
+            price = self.price_at(time_ns)
+            self.fills.append(
+                {
+                    "time_ns": time_ns,
+                    "qty": qty,
+                    "price": price,
+                    "side": side,
+                    "notional": qty * price,
+                }
+            )
+        return self.fills
 
-# Example usage
+
 if __name__ == "__main__":
-    import time
+    SECOND = 1_000_000_000
 
-    print("Backtest Engine Example")
+    # Ten seconds of prices at 100 ms intervals, drifting up.
+    path = [(i * SECOND // 10, 50_000.0 + i * 0.5) for i in range(100)]
+    engine = BacktestEngine(path)
 
-    # Generate synthetic price path (10 seconds of data at 100ms intervals)
-    start_time = int(time.time() * 1e9)
-    price_path = [
-        (start_time + i * 100_000_000, 50000.0 + i * 0.5)  # Slow drift upward
-        for i in range(100)
-    ]
+    engine.run_twap(0, 5 * SECOND, 1_000, 10, side="BUY")
+    print("TWAP:", engine.calculate_metrics())
 
-    # Create backtest engine
-    engine = BacktestEngine(price_path)
-
-    # Run TWAP execution
-    print("\n=== Standard TWAP ===")
-    fills = engine.run_twap(
-        start_ns=start_time,
-        end_ns=start_time + 5_000_000_000,  # 5 seconds
-        total_qty=1000,
-        num_slices=10,
-        side="BUY",
-    )
-
-    print(f"Generated {len(fills)} fills")
-    for fill in fills[:3]:
-        print(f"  Time: {fill['time_ns']}, Qty: {fill['qty']}, Price: {fill['price']:.2f}")
-
-    metrics = engine.calculate_metrics()
-    print("\nMetrics:")
-    for key, value in metrics.items():
-        print(f"  {key}: {value:.4f}")
-
-    # Run randomized TWAP
-    print("\n=== Randomized TWAP ===")
-    fills_rand = engine.run_twap_randomized(
-        start_ns=start_time,
-        end_ns=start_time + 5_000_000_000,
-        total_qty=1000,
-        num_slices=10,
-        seed=42,
-        side="BUY",
-    )
-
-    print(f"Generated {len(fills_rand)} fills with jitter")
-    metrics_rand = engine.calculate_metrics()
-    print(f"Slippage: {metrics_rand['slippage_bps']:.2f} bps")
+    engine.run_twap_randomized(0, 5 * SECOND, 1_000, 10, seed=42, side="BUY")
+    print("Randomized TWAP:", engine.calculate_metrics())

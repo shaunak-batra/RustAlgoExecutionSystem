@@ -298,12 +298,21 @@ impl ExecutionEngine {
         }
 
         // Compute TWAP schedule
-        let schedule = compute_twap_schedule(TwapParams {
+        let schedule = match compute_twap_schedule(TwapParams {
             start_ns,
             end_ns,
             total_qty: qty,
             num_slices,
-        });
+        }) {
+            Ok(schedule) => schedule,
+            Err(e) => {
+                error!("Cannot schedule parent order {}: {}", parent_id, e);
+                let mut rejected_order = parent_order;
+                rejected_order.status = ParentOrderStatus::Rejected;
+                self.state.add_parent_order(rejected_order);
+                return;
+            }
+        };
 
         info!(
             "Generated {} child orders for parent {}",

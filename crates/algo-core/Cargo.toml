@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 serde = { workspace = true }
-orderbook = { path = "../orderbook" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

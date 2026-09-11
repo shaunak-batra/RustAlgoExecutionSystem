@@ -1,34 +1,43 @@
 //! # Execution Algorithms
 //!
-//! Scheduling functions for splitting a parent order into child orders.
+//! Schedulers that split a parent order into child orders:
 //!
-//! - **TWAP (Time-Weighted Average Price)**: Splits orders evenly over time
-//! - **VWAP (Volume-Weighted Average Price)**
-//! - **POV (Percentage of Volume)**
-//! - **Implementation Shortfall (IS)**
+//! - [`twap`]: equal quantities per time slice, optionally released at a
+//!   seeded random time inside each slice
+//! - [`vwap`]: quantities proportional to a historical intraday volume profile
+//! - [`pov`]: a fixed share of observed market volume, without look-ahead
+//! - [`is`]: implementation shortfall via the Almgren–Chriss optimal trajectory
 //!
-//! ## Example Usage
+//! Every scheduler validates its input and returns a [`ScheduleError`] rather
+//! than panicking or silently returning an empty schedule. Quantities are
+//! integers that sum exactly to the order size (for POV, to what the observed
+//! volume allows).
+//!
+//! ## Example
 //!
 //! ```
-//! use algo_core::twap::{TwapParams, compute_twap_schedule};
+//! use algo_core::{compute_twap_schedule, TwapParams};
 //!
-//! let params = TwapParams {
+//! let schedule = compute_twap_schedule(TwapParams {
 //!     start_ns: 0,
 //!     end_ns: 10_000_000_000, // 10 seconds
-//!     total_qty: 1000,
+//!     total_qty: 1_000,
 //!     num_slices: 10,
-//! };
+//! })
+//! .unwrap();
 //!
-//! let schedule = compute_twap_schedule(params);
 //! assert_eq!(schedule.len(), 10);
+//! assert!(schedule.iter().all(|child| child.qty == 100));
 //! ```
 
 pub mod is;
 pub mod pov;
+pub mod schedule;
 pub mod twap;
 pub mod vwap;
 
 pub use is::*;
 pub use pov::*;
+pub use schedule::*;
 pub use twap::*;
 pub use vwap::*;

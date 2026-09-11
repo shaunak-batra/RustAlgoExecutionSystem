@@ -140,7 +140,6 @@ dependencies = [
 name = "algo-core"
 version = "0.1.0"
 dependencies = [
- "orderbook",
  "proptest",
  "serde",
  "thiserror 2.0.17",
@@ -3565,6 +3564,7 @@ name = "python-bindings"
 version = "0.1.0"
 dependencies = [
  "algo-core",
+ "orderbook",
  "pyo3",
 ]
 

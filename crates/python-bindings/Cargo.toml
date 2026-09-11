@@ -16,3 +16,4 @@ extension-module = ["pyo3/extension-module"]
 pyo3 = { workspace = true }
 
 algo-core = { path = "../algo-core" }
+orderbook = { path = "../orderbook" }
