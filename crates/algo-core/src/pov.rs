@@ -73,11 +73,7 @@ mod tests {
 
     #[test]
     fn test_pov_basic() {
-        let market_volumes = vec![
-            (1000, 500),
-            (2000, 500),
-            (3000, 500),
-        ];
+        let market_volumes = vec![(1000, 500), (2000, 500), (3000, 500)];
 
         let params = PovParams {
             start_ns: 0,

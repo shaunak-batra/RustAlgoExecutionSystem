@@ -17,6 +17,7 @@ algo-core = { path = "../algo-core" }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,21 +1,11 @@
-//! # Algorithmic Trading Strategies
+//! # Execution Algorithms
 //!
-//! Core library of algorithmic trading strategies for optimal order execution.
-//!
-//! ## Available Strategies
+//! Scheduling functions for splitting a parent order into child orders.
 //!
 //! - **TWAP (Time-Weighted Average Price)**: Splits orders evenly over time
-//! - **Adaptive TWAP**: TWAP with dynamic adjustment based on market conditions
-//! - **VWAP (Volume-Weighted Average Price)**: Matches historical volume patterns
-//! - **POV (Percentage of Volume)**: Executes as a percentage of market volume
-//! - **Implementation Shortfall (IS)**: Minimizes cost relative to decision price
-//!
-//! ## Key Features
-//!
-//! - **Pure Functions**: All algorithms are deterministic and side-effect free
-//! - **FFI-Safe**: Compatible with C/C++ and other language bindings
-//! - **Validated Input**: Comprehensive error handling for invalid parameters
-//! - **Simulation Ready**: Designed for backtesting and live trading
+//! - **VWAP (Volume-Weighted Average Price)**
+//! - **POV (Percentage of Volume)**
+//! - **Implementation Shortfall (IS)**
 //!
 //! ## Example Usage
 //!
@@ -33,14 +23,12 @@
 //! assert_eq!(schedule.len(), 10);
 //! ```
 
-pub mod twap;
-pub mod pov;
-pub mod vwap;
 pub mod is;
-pub mod adaptive_twap;
+pub mod pov;
+pub mod twap;
+pub mod vwap;
 
-pub use twap::*;
-pub use pov::*;
-pub use vwap::*;
 pub use is::*;
-pub use adaptive_twap::*;
+pub use pov::*;
+pub use twap::*;
+pub use vwap::*;

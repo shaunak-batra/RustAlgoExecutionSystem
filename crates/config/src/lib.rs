@@ -161,9 +161,9 @@ impl SystemConfig {
     }
 
     /// Load configuration from a string
-    pub fn from_str(contents: &str) -> Result<Self> {
-        let config: SystemConfig = toml::from_str(contents)
-            .context("Failed to parse config from string")?;
+    pub fn from_toml_str(contents: &str) -> Result<Self> {
+        let config: SystemConfig =
+            toml::from_str(contents).context("Failed to parse config from string")?;
 
         config.validate()?;
         Ok(config)
@@ -207,8 +207,10 @@ impl SystemConfig {
         }
 
         // Validate algorithm configs
-        if self.algorithms.pov.default_participation_rate < self.algorithms.pov.min_participation_rate
-            || self.algorithms.pov.default_participation_rate > self.algorithms.pov.max_participation_rate
+        if self.algorithms.pov.default_participation_rate
+            < self.algorithms.pov.min_participation_rate
+            || self.algorithms.pov.default_participation_rate
+                > self.algorithms.pov.max_participation_rate
         {
             anyhow::bail!(
                 "pov.default_participation_rate must be between min_participation_rate and max_participation_rate"
@@ -221,9 +223,11 @@ impl SystemConfig {
 
         Ok(())
     }
+}
 
+impl Default for SystemConfig {
     /// Create a default configuration
-    pub fn default() -> Self {
+    fn default() -> Self {
         Self {
             engine: EngineConfig {
                 clock_tick_interval_ms: 100,
@@ -399,7 +403,7 @@ risk_aversion = 1.0
 impact_model = "almgren_chriss"
         "#;
 
-        let config = SystemConfig::from_str(toml_str);
+        let config = SystemConfig::from_toml_str(toml_str);
         assert!(config.is_ok());
         let config = config.unwrap();
         assert_eq!(config.market_data.mode, "rest_api");

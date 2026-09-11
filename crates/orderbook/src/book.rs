@@ -35,13 +35,7 @@ pub struct Fill {
 }
 
 impl Order {
-    pub fn new(
-        id: OrderId,
-        side: Side,
-        price: Price,
-        qty: Quantity,
-        timestamp: Timestamp,
-    ) -> Self {
+    pub fn new(id: OrderId, side: Side, price: Price, qty: Quantity, timestamp: Timestamp) -> Self {
         Self {
             id,
             side,
@@ -152,10 +146,7 @@ impl OrderBook {
                         .entry(order.price)
                         .and_modify(|q| *q = q.saturating_add(order.qty))
                         .or_insert(order.qty);
-                    self.bids
-                        .entry(order.price)
-                        .or_insert_with(VecDeque::new)
-                        .push_back(order);
+                    self.bids.entry(order.price).or_default().push_back(order);
                 }
             }
 
@@ -231,10 +222,7 @@ impl OrderBook {
                         .entry(order.price)
                         .and_modify(|q| *q = q.saturating_add(order.qty))
                         .or_insert(order.qty);
-                    self.asks
-                        .entry(order.price)
-                        .or_insert_with(VecDeque::new)
-                        .push_back(order);
+                    self.asks.entry(order.price).or_default().push_back(order);
                 }
             }
         }
@@ -293,12 +281,18 @@ impl OrderBook {
 
     /// Get total bid depth at price level
     pub fn bid_qty_at(&self, price: Price) -> Quantity {
-        self.bid_depth.get(&price).copied().unwrap_or(Quantity::ZERO)
+        self.bid_depth
+            .get(&price)
+            .copied()
+            .unwrap_or(Quantity::ZERO)
     }
 
     /// Get total ask depth at price level
     pub fn ask_qty_at(&self, price: Price) -> Quantity {
-        self.ask_depth.get(&price).copied().unwrap_or(Quantity::ZERO)
+        self.ask_depth
+            .get(&price)
+            .copied()
+            .unwrap_or(Quantity::ZERO)
     }
 
     /// Get top N levels of bids (highest first)
@@ -322,7 +316,12 @@ impl OrderBook {
 
     /// Seed the orderbook with market maker liquidity at a reference price
     /// This creates BUY and SELL orders to provide liquidity for testing
-    pub fn seed_market_maker(&mut self, mid_price: Price, num_levels: usize, qty_per_level: Quantity) {
+    pub fn seed_market_maker(
+        &mut self,
+        mid_price: Price,
+        num_levels: usize,
+        qty_per_level: Quantity,
+    ) {
         let mut order_id = 9_000_000_000_000_000_000u64; // Use high IDs for MM orders
 
         // Add ask (sell) orders above mid price
@@ -338,11 +337,10 @@ impl OrderBook {
                 Timestamp::now_nanos(),
             );
 
-            self.asks.entry(ask_price)
-                .or_insert_with(VecDeque::new)
-                .push_back(order);
+            self.asks.entry(ask_price).or_default().push_back(order);
 
-            self.ask_depth.entry(ask_price)
+            self.ask_depth
+                .entry(ask_price)
                 .and_modify(|q| q.0 += qty_per_level.0)
                 .or_insert(qty_per_level);
 
@@ -362,11 +360,10 @@ impl OrderBook {
                 Timestamp::now_nanos(),
             );
 
-            self.bids.entry(bid_price)
-                .or_insert_with(VecDeque::new)
-                .push_back(order);
+            self.bids.entry(bid_price).or_default().push_back(order);
 
-            self.bid_depth.entry(bid_price)
+            self.bid_depth
+                .entry(bid_price)
                 .and_modify(|q| q.0 += qty_per_level.0)
                 .or_insert(qty_per_level);
 
@@ -525,7 +522,7 @@ mod tests {
         let fills = book.insert_order(buy);
 
         // Should get one fill that consumed full first order + partial second
-        assert!(fills.len() >= 1);
+        assert!(!fills.is_empty());
         let total_filled: u64 = fills.iter().map(|f| f.fill_qty.0).sum();
         assert_eq!(total_filled, 15);
     }

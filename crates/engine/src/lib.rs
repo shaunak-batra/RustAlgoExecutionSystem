@@ -4,15 +4,13 @@
 //!
 //! - **Event Loop**: Main execution engine that processes orders and manages state
 //! - **State Management**: Position tracking, order management, and execution state
-//! - **Risk Management**: Pre-trade and post-trade risk checks
-//! - **Smart Order Routing**: Multi-venue routing with configurable strategies
+//! - **Risk Management**: Pre-trade risk checks
 //!
 //! ## Key Components
 //!
 //! - [`ExecutionEngine`]: Main event loop that handles order submission and execution
 //! - [`EngineState`]: Central state store for positions, orders, and execution history
-//! - [`RiskChecker`]: Pre-trade and post-trade risk validation
-//! - [`SmartRouter`]: Intelligent order routing across multiple venues
+//! - [`RiskChecker`]: Pre-trade risk validation
 //!
 //! ## Example Usage
 //!
@@ -28,13 +26,11 @@
 //! # }
 //! ```
 
-pub mod state;
-pub mod risk;
 pub mod event_loop;
-pub mod routing;
+pub mod risk;
+pub mod state;
 
 pub use api::{EngineCommand, ParentOrder, ParentOrderStatus, Position};
 pub use event_loop::ExecutionEngine;
 pub use risk::{RiskChecker, RiskConfig, RiskError};
 pub use state::EngineState;
-pub use routing::*;

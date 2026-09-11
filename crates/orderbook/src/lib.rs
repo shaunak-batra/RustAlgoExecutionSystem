@@ -1,11 +1,9 @@
 //! # Order Book
 //!
-//! High-performance order book implementation with support for:
+//! Single-symbol limit order book with price-time priority matching.
 //!
-//! - **Price-Time Priority Matching**: Standard FIFO order matching at each price level
-//! - **Multiple Order Types**: Market, Limit, FOK (Fill-or-Kill), IOC (Immediate-or-Cancel)
-//! - **Advanced Order Types**: Stop orders, iceberg orders, and pegged orders
-//! - **Market Making**: Built-in market maker for liquidity simulation
+//! - **Price-Time Priority Matching**: FIFO order matching at each price level
+//! - **Time-in-Force**: GTC, IOC (Immediate-or-Cancel), FOK (Fill-or-Kill)
 //!
 //! ## Key Components
 //!
@@ -35,12 +33,8 @@
 //! println!("Fills: {:?}", fills);
 //! ```
 
-pub mod types;
 pub mod book;
-pub mod advanced_orders;
-pub mod simulation;
+pub mod types;
 
-pub use types::*;
 pub use book::*;
-pub use advanced_orders::*;
-pub use simulation::*;
+pub use types::*;

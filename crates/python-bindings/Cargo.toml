@@ -1,16 +1,18 @@
 [package]
-name = "algo_exec_rs"
+name = "python-bindings"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "algo_exec_rs"
+name = "algo_exec_native"
 crate-type = ["cdylib"]
+
+[features]
+# Enabled by maturin when building the wheel (python/pyproject.toml).
+# Left off for `cargo test`, which must link against libpython.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 pyo3 = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 algo-core = { path = "../algo-core" }
-orderbook = { path = "../orderbook" }

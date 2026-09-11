@@ -1,32 +1,7 @@
-# Core dependencies for algo-exec-py
-# Install with: pip install -r requirements.txt
-
-# Build tools
-maturin>=1.7.0,<2.0.0
-
-# gRPC client
-grpcio>=1.60.0
-grpcio-tools>=1.60.0
-protobuf>=4.25.0
-
-# Data processing (optional but recommended)
-numpy>=1.24.0
-
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-cov>=4.1.0
-
-# Code quality
-black>=23.7.0
-mypy>=1.5.0
-flake8>=6.1.0
-
-# Type stubs
-types-protobuf>=4.24.0
-
-# Async utilities
-asyncio>=3.4.3
-
-# For examples and strategies
-python-dateutil>=2.8.2
+# Build and test dependencies for the Python bindings.
+#   pip install -r python/requirements.txt
+#   pip install ./python
+#   pytest python/tests
+maturin>=1.7,<2.0
+pytest>=7.4
+hypothesis>=6.0

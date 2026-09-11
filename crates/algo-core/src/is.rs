@@ -54,7 +54,8 @@ pub fn compute_is_schedule(params: IsParams) -> Vec<IsOrderInstruction> {
         let qty = ((params.total_qty as f64 * target_fraction).round() as u64).min(remaining_qty);
 
         if qty > 0 {
-            let target_time_ns = params.start_ns + ((i as f64 / params.num_slices as f64) * duration_ns as f64) as u64;
+            let target_time_ns = params.start_ns
+                + ((i as f64 / params.num_slices as f64) * duration_ns as f64) as u64;
 
             instructions.push(IsOrderInstruction {
                 target_time_ns,

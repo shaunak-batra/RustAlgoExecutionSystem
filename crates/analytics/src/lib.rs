@@ -253,7 +253,11 @@ impl PerformanceAnalyzer {
         }
 
         let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter().map(|r| (r - mean_return).powi(2)).sum::<f64>() / returns.len() as f64;
+        let variance = returns
+            .iter()
+            .map(|r| (r - mean_return).powi(2))
+            .sum::<f64>()
+            / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         if std_dev == 0.0 {
@@ -276,7 +280,8 @@ impl PerformanceAnalyzer {
             .iter()
             .filter(|&&r| r < 0.0)
             .map(|r| r.powi(2))
-            .sum::<f64>() / returns.len() as f64;
+            .sum::<f64>()
+            / returns.len() as f64;
         let downside_std = downside_variance.sqrt();
 
         if downside_std == 0.0 {
@@ -319,7 +324,8 @@ impl PerformanceAnalyzer {
         }
 
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let variance =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let daily_vol = variance.sqrt();
         let annual_vol = daily_vol * (252.0_f64).sqrt() * 100.0; // Annualized percentage
 
@@ -334,7 +340,11 @@ impl PerformanceAnalyzer {
         }
 
         let mean = downside_returns.iter().sum::<f64>() / downside_returns.len() as f64;
-        let variance = downside_returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / downside_returns.len() as f64;
+        let variance = downside_returns
+            .iter()
+            .map(|r| (r - mean).powi(2))
+            .sum::<f64>()
+            / downside_returns.len() as f64;
         let daily_vol = variance.sqrt();
         let annual_vol = daily_vol * (252.0_f64).sqrt() * 100.0;
 
@@ -377,11 +387,9 @@ impl PerformanceAnalyzer {
         let mut monthly_pnl: HashMap<String, f64> = HashMap::new();
 
         for trade in &self.trades {
-            let datetime = chrono::DateTime::from_timestamp(
-                (trade.timestamp / 1_000_000_000) as i64,
-                0,
-            )
-            .unwrap();
+            let datetime =
+                chrono::DateTime::from_timestamp((trade.timestamp / 1_000_000_000) as i64, 0)
+                    .unwrap();
             let month_key = datetime.format("%Y-%m").to_string();
 
             *monthly_pnl.entry(month_key).or_insert(0.0) += trade.pnl;
@@ -411,7 +419,8 @@ pub fn correlation(x: &[f64], y: &[f64]) -> Result<f64> {
         .iter()
         .zip(y.iter())
         .map(|(&xi, &yi)| (xi - mean_x) * (yi - mean_y))
-        .sum::<f64>() / n;
+        .sum::<f64>()
+        / n;
 
     let var_x: f64 = x.iter().map(|&xi| (xi - mean_x).powi(2)).sum::<f64>() / n;
     let var_y: f64 = y.iter().map(|&yi| (yi - mean_y).powi(2)).sum::<f64>() / n;
@@ -518,12 +527,7 @@ pub fn export_trades_to_csv(trades: &[Trade], filepath: &str) -> std::io::Result
         writeln!(
             file,
             "{},{},{:?},{},{},{}",
-            trade.timestamp,
-            trade.symbol,
-            trade.side,
-            trade.quantity,
-            trade.price,
-            trade.pnl
+            trade.timestamp, trade.symbol, trade.side, trade.quantity, trade.price, trade.pnl
         )?;
     }
 
@@ -543,7 +547,11 @@ pub fn export_metrics_to_csv(metrics: &PerformanceMetrics, filepath: &str) -> st
     writeln!(file, "Sortino Ratio,{:.2}", metrics.sortino_ratio)?;
     writeln!(file, "Calmar Ratio,{:.2}", metrics.calmar_ratio)?;
     writeln!(file, "Max Drawdown,{:.2}%", metrics.max_drawdown)?;
-    writeln!(file, "Max DD Duration,{:.1} days", metrics.max_drawdown_duration_days)?;
+    writeln!(
+        file,
+        "Max DD Duration,{:.1} days",
+        metrics.max_drawdown_duration_days
+    )?;
     writeln!(file, "Total Trades,{}", metrics.total_trades)?;
     writeln!(file, "Win Rate,{:.1}%", metrics.win_rate * 100.0)?;
     writeln!(file, "Profit Factor,{:.2}", metrics.profit_factor)?;

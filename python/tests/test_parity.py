@@ -1,25 +1,25 @@
 """
-Parity tests to ensure gRPC and FFI produce identical results.
+Tests for the PyO3 bindings (``algo_exec_py._native``).
 
-This validates that backtests using FFI will match live execution via gRPC.
+They check that the Python-visible functions return exactly what the Rust
+library computes (same slice counts, quantities, and timestamps).
+
+The import is unconditional on purpose: if the extension is not built, the
+suite fails instead of silently skipping.
 """
 
 import pytest
 
-try:
-    import algo_exec_rs
-    HAS_FFI = True
-except ImportError:
-    HAS_FFI = False
+import algo_exec_py as ae
+from algo_exec_py import _native
 
 
-@pytest.mark.skipif(not HAS_FFI, reason="FFI module not built")
-class TestTWAPParity:
-    """Test parity between different interfaces for TWAP algorithm."""
+class TestTWAPBindings:
+    """TWAP schedule computed through the bindings."""
 
     def test_twap_schedule_correctness(self):
         """Verify TWAP schedule is mathematically correct."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=10_000_000_000,  # 10 seconds
             total_qty=1000,
@@ -43,7 +43,7 @@ class TestTWAPParity:
 
     def test_twap_with_remainder(self):
         """Test TWAP with quantity that doesn't divide evenly."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=5_000_000_000,
             total_qty=103,
@@ -63,7 +63,7 @@ class TestTWAPParity:
 
     def test_twap_single_slice(self):
         """Test TWAP with single slice (degenerate case)."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=1000,
             end_ns=5000,
             total_qty=50,
@@ -75,7 +75,7 @@ class TestTWAPParity:
 
     def test_twap_timing_distribution(self):
         """Test that slices are evenly distributed in time."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=10_000_000_000,
             total_qty=100,
@@ -92,8 +92,8 @@ class TestTWAPParity:
         """Test that randomized TWAP is deterministic with same seed."""
         params = (0, 10_000_000_000, 1000, 10, 42)
 
-        schedule1 = algo_exec_rs.compute_twap_randomized_py(*params)
-        schedule2 = algo_exec_rs.compute_twap_randomized_py(*params)
+        schedule1 = ae.compute_twap_randomized_py(*params)
+        schedule2 = ae.compute_twap_randomized_py(*params)
 
         assert schedule1 == schedule2
 
@@ -101,8 +101,8 @@ class TestTWAPParity:
         """Test that different seeds produce different schedules."""
         base_params = (0, 10_000_000_000, 1000, 10)
 
-        schedule1 = algo_exec_rs.compute_twap_randomized_py(*base_params, 42)
-        schedule2 = algo_exec_rs.compute_twap_randomized_py(*base_params, 123)
+        schedule1 = ae.compute_twap_randomized_py(*base_params, 42)
+        schedule2 = ae.compute_twap_randomized_py(*base_params, 123)
 
         # Quantities should be same
         qtys1 = [qty for _, qty in schedule1]
@@ -119,7 +119,7 @@ class TestTWAPParity:
         start_ns = 1_000_000_000
         end_ns = 11_000_000_000
 
-        schedule = algo_exec_rs.compute_twap_randomized_py(
+        schedule = ae.compute_twap_randomized_py(
             start_ns, end_ns, 500, 5, 999
         )
 
@@ -129,23 +129,21 @@ class TestTWAPParity:
     def test_price_conversions(self):
         """Test price conversion utilities."""
         # Test float to ticks
-        ticks = algo_exec_rs.price_from_float(42.50)
+        ticks = ae.price_from_float(42.50)
         assert ticks == 4_250_000
 
         # Test ticks to float
-        price = algo_exec_rs.price_to_float(ticks)
+        price = ae.price_to_float(ticks)
         assert abs(price - 42.50) < 0.00001
 
         # Round trip
         original = 12345.6789
-        converted = algo_exec_rs.price_to_float(
-            algo_exec_rs.price_from_float(original)
-        )
+        converted = ae.price_to_float(ae.price_from_float(original))
         assert abs(converted - original) < 0.00001
 
     def test_zero_quantity(self):
         """Test edge case: zero quantity."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=10_000,
             total_qty=0,
@@ -156,7 +154,7 @@ class TestTWAPParity:
 
     def test_zero_slices(self):
         """Test edge case: zero slices."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=10_000,
             total_qty=100,
@@ -167,7 +165,7 @@ class TestTWAPParity:
 
     def test_invalid_time_range(self):
         """Test edge case: end before start."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=10_000,
             end_ns=5_000,  # end before start!
             total_qty=100,
@@ -178,7 +176,7 @@ class TestTWAPParity:
 
     def test_large_quantities(self):
         """Test with large quantities."""
-        schedule = algo_exec_rs.compute_twap_py(
+        schedule = ae.compute_twap_py(
             start_ns=0,
             end_ns=1_000_000_000,
             total_qty=1_000_000,
@@ -194,51 +192,35 @@ class TestTWAPParity:
             assert qty == 10_000
 
 
-@pytest.mark.skipif(not HAS_FFI, reason="FFI module not built")
 class TestModuleMetadata:
     """Test module-level attributes."""
 
     def test_version(self):
-        """Test module has version."""
-        assert hasattr(algo_exec_rs, '__version__')
-        assert isinstance(algo_exec_rs.__version__, str)
+        """Test native module has version."""
+        assert isinstance(_native.__version__, str)
 
     def test_tick_scale(self):
         """Test TICK_SCALE constant."""
-        assert hasattr(algo_exec_rs, 'TICK_SCALE')
-        assert algo_exec_rs.TICK_SCALE == 100_000
+        assert ae.TICK_SCALE == 100_000
 
 
-# Benchmarks (run with pytest-benchmark if available)
-@pytest.mark.skipif(not HAS_FFI, reason="FFI module not built")
-class TestPerformance:
-    """Performance benchmarks for FFI calls."""
+class TestBacktestHarness:
+    """The pure-Python harness runs end to end on top of the bindings."""
 
-    def test_twap_schedule_performance(self, benchmark):
-        """Benchmark TWAP schedule generation."""
-        if not pytest:
-            pytest.skip("pytest-benchmark not available")
+    def test_twap_backtest_vwap_matches_linear_path(self):
+        from algo_exec_py.backtest.engine import BacktestEngine
 
-        result = benchmark(
-            algo_exec_rs.compute_twap_py,
-            0, 10_000_000_000, 1000, 100
-        )
+        # Price rises linearly by 1.0 per second; TWAP fills at slice starts 0..9s.
+        path = [(i * 1_000_000_000, 100.0 + i) for i in range(11)]
+        engine = BacktestEngine(path)
+        fills = engine.run_twap(0, 10_000_000_000, 1000, 10)
 
-        assert len(result) == 100
-
-    def test_price_conversion_performance(self, benchmark):
-        """Benchmark price conversions."""
-        if not pytest:
-            pytest.skip("pytest-benchmark not available")
-
-        result = benchmark(
-            algo_exec_rs.price_from_float,
-            12345.6789
-        )
-
-        assert isinstance(result, int)
+        assert len(fills) == 10
+        metrics = engine.calculate_metrics()
+        assert metrics["total_qty"] == 1000
+        # Equal quantities at prices 100..109 -> VWAP 104.5
+        assert metrics["vwap"] == pytest.approx(104.5)
 
 
 if __name__ == "__main__":
-    # Run tests
     pytest.main([__file__, "-v"])

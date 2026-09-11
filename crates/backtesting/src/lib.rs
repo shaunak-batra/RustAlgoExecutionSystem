@@ -1,18 +1,14 @@
-pub mod replay;
-
 use analytics::{PerformanceAnalyzer, Trade, TradeType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
-pub use replay::*;
-
 // Constants for default rates
-const DEFAULT_RISK_FREE_RATE: f64 = 0.02;      // 2% annual risk-free rate
+const DEFAULT_RISK_FREE_RATE: f64 = 0.02; // 2% annual risk-free rate
 #[allow(dead_code)]
-const DEFAULT_COMMISSION_RATE: f64 = 0.001;   // 0.1% commission per trade
+const DEFAULT_COMMISSION_RATE: f64 = 0.001; // 0.1% commission per trade
 #[allow(dead_code)]
-const DEFAULT_SLIPPAGE_RATE: f64 = 0.0001;    // 0.01% slippage per trade
+const DEFAULT_SLIPPAGE_RATE: f64 = 0.0001; // 0.01% slippage per trade
 
 #[derive(Debug, Error)]
 pub enum BacktestError {
@@ -129,7 +125,13 @@ impl Portfolio {
         self.equity = self.cash + total_position_value;
     }
 
-    pub fn execute_buy(&mut self, symbol: String, quantity: f64, price: f64, timestamp: u64) -> Option<Trade> {
+    pub fn execute_buy(
+        &mut self,
+        symbol: String,
+        quantity: f64,
+        price: f64,
+        timestamp: u64,
+    ) -> Option<Trade> {
         let cost = quantity * price;
 
         if cost > self.cash {
@@ -170,7 +172,13 @@ impl Portfolio {
         })
     }
 
-    pub fn execute_sell(&mut self, symbol: String, quantity: f64, price: f64, timestamp: u64) -> Option<Trade> {
+    pub fn execute_sell(
+        &mut self,
+        symbol: String,
+        quantity: f64,
+        price: f64,
+        timestamp: u64,
+    ) -> Option<Trade> {
         let pos = self.positions.get_mut(&symbol)?;
 
         if pos.quantity < quantity {
@@ -265,7 +273,10 @@ impl BacktestEngine {
                         price,
                     } => {
                         let exec_price = price.unwrap_or(bar.ohlcv.close) * (1.0 + self.slippage);
-                        if let Some(trade) = self.portfolio.execute_buy(symbol, quantity, exec_price, bar.timestamp) {
+                        if let Some(trade) =
+                            self.portfolio
+                                .execute_buy(symbol, quantity, exec_price, bar.timestamp)
+                        {
                             self.analyzer.add_trade(trade);
                         }
                     }
@@ -275,13 +286,19 @@ impl BacktestEngine {
                         price,
                     } => {
                         let exec_price = price.unwrap_or(bar.ohlcv.close) * (1.0 - self.slippage);
-                        if let Some(trade) = self.portfolio.execute_sell(symbol, quantity, exec_price, bar.timestamp) {
+                        if let Some(trade) =
+                            self.portfolio
+                                .execute_sell(symbol, quantity, exec_price, bar.timestamp)
+                        {
                             self.analyzer.add_trade(trade);
                         }
                     }
                     Signal::Close { symbol } => {
                         let exec_price = bar.ohlcv.close * (1.0 - self.slippage);
-                        if let Some(trade) = self.portfolio.close_position(&symbol, exec_price, bar.timestamp) {
+                        if let Some(trade) =
+                            self.portfolio
+                                .close_position(&symbol, exec_price, bar.timestamp)
+                        {
                             self.analyzer.add_trade(trade);
                         }
                     }
@@ -419,7 +436,12 @@ mod tests {
     #[test]
     fn test_backtest_engine() {
         let strategy = Box::new(SMAStrategy::new("BTC".to_string(), 10, 20));
-        let mut engine = BacktestEngine::new(strategy, 100_000.0, DEFAULT_COMMISSION_RATE, DEFAULT_SLIPPAGE_RATE);
+        let mut engine = BacktestEngine::new(
+            strategy,
+            100_000.0,
+            DEFAULT_COMMISSION_RATE,
+            DEFAULT_SLIPPAGE_RATE,
+        );
 
         let data = generate_test_data(100);
         engine.run(data).unwrap();
@@ -432,11 +454,15 @@ mod tests {
     fn test_portfolio() {
         let mut portfolio = Portfolio::new(100_000.0);
 
-        let trade = portfolio.execute_buy("BTC".to_string(), 1.0, 50000.0, 1000).unwrap();
+        let trade = portfolio
+            .execute_buy("BTC".to_string(), 1.0, 50000.0, 1000)
+            .unwrap();
         assert_eq!(trade.quantity, 1.0);
         assert_eq!(portfolio.cash, 50_000.0);
 
-        let trade = portfolio.execute_sell("BTC".to_string(), 1.0, 55000.0, 2000).unwrap();
+        let trade = portfolio
+            .execute_sell("BTC".to_string(), 1.0, 55000.0, 2000)
+            .unwrap();
         assert_eq!(trade.pnl, 5000.0);
         assert_eq!(portfolio.cash, 105_000.0);
     }

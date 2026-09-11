@@ -1,5 +1,8 @@
+// `#[pyfunction]` in pyo3 0.22 expands to a `PyErr -> PyErr` conversion that clippy flags.
+#![allow(clippy::useless_conversion)]
+
+use algo_core::twap::{compute_twap_randomized, compute_twap_schedule, TwapParams};
 use pyo3::prelude::*;
-use algo_core::twap::{compute_twap_schedule, compute_twap_randomized, TwapParams};
 
 /// Python wrapper for compute_twap_schedule.
 /// Returns a list of tuples: [(target_time_ns, qty), ...]
@@ -61,9 +64,10 @@ fn price_to_float(ticks: i64) -> f64 {
     ticks as f64 / 100_000.0
 }
 
-/// Python module definition
+/// Python module definition, installed as `algo_exec_py._native`.
 #[pymodule]
-fn algo_exec_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_native")]
+fn algo_exec_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_twap_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_twap_randomized_py, m)?)?;
     m.add_function(wrap_pyfunction!(price_from_float, m)?)?;

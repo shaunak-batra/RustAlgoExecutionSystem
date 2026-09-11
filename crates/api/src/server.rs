@@ -2,9 +2,9 @@ use crate::proto::execution_service_server::{ExecutionService, ExecutionServiceS
 use crate::proto::*;
 use crate::types::{EngineCommand, ParentOrderStatus};
 use orderbook::{Price, Side};
+use std::str::FromStr;
 use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
-use std::str::FromStr;
 
 /// gRPC service implementation for the execution engine.
 pub struct ExecutionServiceImpl {
@@ -97,10 +97,7 @@ impl ExecutionService for ExecutionServiceImpl {
         .to_string();
 
         let avg_fill_price = if parent_order.filled_qty.value() > 0 {
-            parent_order
-                .limit_price
-                .map(|p| p.as_f64())
-                .unwrap_or(0.0)
+            parent_order.limit_price.map(|p| p.as_f64()).unwrap_or(0.0)
         } else {
             0.0
         };
@@ -186,7 +183,7 @@ impl ExecutionService for ExecutionServiceImpl {
                         let fill_event = FillEvent {
                             order_id: fill.order_id.value(),
                             fill_qty: fill.fill_qty.value(),
-                            fill_price_ticks: fill.fill_price.ticks() as i64,
+                            fill_price_ticks: fill.fill_price.ticks(),
                             timestamp_ns: fill.timestamp.nanos(),
                         };
 
@@ -202,7 +199,9 @@ impl ExecutionService for ExecutionServiceImpl {
                         let error_msg = format!("Fill stream lagged: {} messages skipped", skipped);
                         if tx.send(Err(Status::data_loss(error_msg))).await.is_err() {
                             // Client disconnected while sending error, gracefully exit
-                            println!("Fill stream closed: client disconnected during error notification");
+                            println!(
+                                "Fill stream closed: client disconnected during error notification"
+                            );
                             break;
                         }
                         continue;
@@ -216,7 +215,9 @@ impl ExecutionService for ExecutionServiceImpl {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 

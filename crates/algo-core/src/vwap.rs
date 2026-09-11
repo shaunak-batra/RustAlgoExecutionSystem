@@ -137,11 +137,7 @@ mod tests {
 
     #[test]
     fn test_vwap_basic() {
-        let historical_data = vec![
-            (1000, 100.0, 1000),
-            (2000, 101.0, 500),
-            (3000, 99.0, 800),
-        ];
+        let historical_data = vec![(1000, 100.0, 1000), (2000, 101.0, 500), (3000, 99.0, 800)];
 
         let params = VwapParams {
             start_ns: 0,

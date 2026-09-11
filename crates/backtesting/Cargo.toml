@@ -6,10 +6,8 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
-chrono = "0.4"
-tracing = { workspace = true }
 
-orderbook = { path = "../orderbook" }
 analytics = { path = "../analytics" }
-indicators = { path = "../indicators" }
-database = { path = "../database" }
+
+[dev-dependencies]
+rand = { workspace = true }

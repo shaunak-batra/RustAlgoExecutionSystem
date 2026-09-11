@@ -1,17 +1,23 @@
-"""Algorithmic Execution Engine - Python Package
+"""Python helpers around the Rust execution-algorithm library.
 
-This package provides:
-- gRPC client for interacting with the Rust execution engine
-- FFI bindings for backtesting via PyO3
-- Backtest harness and analysis tools
+- ``algo_exec_py._native``: PyO3 extension module built from ``crates/python-bindings``
+- ``algo_exec_py.backtest``: a small execution-backtest harness built on it
 """
+
+from ._native import (
+    TICK_SCALE,
+    compute_twap_py,
+    compute_twap_randomized_py,
+    price_from_float,
+    price_to_float,
+)
 
 __version__ = "0.1.0"
 
-# FFI module will be imported when available after maturin build
-try:
-    import algo_exec_rs
-    __all__ = ["algo_exec_rs"]
-except ImportError:
-    # Not yet built with maturin
-    pass
+__all__ = [
+    "TICK_SCALE",
+    "compute_twap_py",
+    "compute_twap_randomized_py",
+    "price_from_float",
+    "price_to_float",
+]

@@ -112,7 +112,9 @@ impl EngineState {
                         + fill_price * fill_qty as f64;
 
                     // Use checked arithmetic to prevent overflow
-                    let new_qty = position.quantity.checked_add(fill_qty)
+                    let new_qty = position
+                        .quantity
+                        .checked_add(fill_qty)
                         .expect("Position quantity overflow on buy - quantity too large");
 
                     position.quantity = new_qty;
@@ -122,7 +124,9 @@ impl EngineState {
                     let pnl = (position.avg_price - fill_price) * fill_qty as f64;
                     position.realized_pnl += pnl;
 
-                    let new_qty = position.quantity.checked_add(fill_qty)
+                    let new_qty = position
+                        .quantity
+                        .checked_add(fill_qty)
                         .expect("Position quantity overflow while reducing short");
 
                     position.quantity = new_qty;
@@ -137,7 +141,9 @@ impl EngineState {
                     let total_cost = position.avg_price * (-position.quantity) as f64
                         + fill_price * fill_qty as f64;
 
-                    let new_qty = position.quantity.checked_sub(fill_qty)
+                    let new_qty = position
+                        .quantity
+                        .checked_sub(fill_qty)
                         .expect("Position quantity underflow on sell - quantity too large");
 
                     position.quantity = new_qty;
@@ -147,7 +153,9 @@ impl EngineState {
                     let pnl = (fill_price - position.avg_price) * fill_qty as f64;
                     position.realized_pnl += pnl;
 
-                    let new_qty = position.quantity.checked_sub(fill_qty)
+                    let new_qty = position
+                        .quantity
+                        .checked_sub(fill_qty)
                         .expect("Position quantity underflow while reducing long");
 
                     position.quantity = new_qty;
@@ -170,7 +178,8 @@ impl EngineState {
             // Calculate unrealized PnL
             // For long positions: (current_price - avg_price) * quantity
             // For short positions: (avg_price - current_price) * abs(quantity)
-            position.unrealized_pnl = (current_price - position.avg_price) * position.quantity as f64;
+            position.unrealized_pnl =
+                (current_price - position.avg_price) * position.quantity as f64;
             position
         })
     }

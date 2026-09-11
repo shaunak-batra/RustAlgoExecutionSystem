@@ -169,7 +169,7 @@ impl RiskChecker {
         }
 
         // Check individual position limits
-        for (_symbol, position) in &state.positions {
+        for position in state.positions.values() {
             if position.quantity.unsigned_abs() > self.config.max_position {
                 return Err(RiskError::PositionLimitExceeded {
                     current: position.quantity,

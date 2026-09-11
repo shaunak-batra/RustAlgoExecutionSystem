@@ -1,14 +1,14 @@
+use analytics::{EquityPoint, PerformanceAnalyzer, PerformanceMetrics, Trade, TradeType};
+use api::proto::execution_service_client::ExecutionServiceClient;
+use api::proto::{ParentOrderRequest, PositionsRequest};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
+use orderbook::Side;
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use orderbook::Side;
-use serde::Deserialize;
-use analytics::{PerformanceMetrics, EquityPoint, Trade, TradeType, PerformanceAnalyzer};
-use api::proto::execution_service_client::ExecutionServiceClient;
-use api::proto::{ParentOrderRequest, PositionsRequest};
 use tonic::transport::Channel;
 
 // ============================================================================
@@ -64,18 +64,18 @@ impl Page {
 
 #[derive(Clone, Debug, PartialEq)]
 enum AlgoType {
-    TWAP,
-    POV,
-    VWAP,
+    Twap,
+    Pov,
+    Vwap,
     IS,
 }
 
 impl std::fmt::Display for AlgoType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AlgoType::TWAP => write!(f, "TWAP"),
-            AlgoType::POV => write!(f, "POV"),
-            AlgoType::VWAP => write!(f, "VWAP"),
+            AlgoType::Twap => write!(f, "TWAP"),
+            AlgoType::Pov => write!(f, "POV"),
+            AlgoType::Vwap => write!(f, "VWAP"),
             AlgoType::IS => write!(f, "IS"),
         }
     }
@@ -315,7 +315,7 @@ impl Default for TraderApp {
             limit_price: "50000.0".to_string(),
             duration_sec: "10.0".to_string(),
             num_slices: "10".to_string(),
-            algo_type: AlgoType::TWAP,
+            algo_type: AlgoType::Twap,
             adaptive_total_qty: "1000".to_string(),
             adaptive_duration_secs: "300".to_string(),
             adaptive_base_slice_secs: "60".to_string(),
@@ -348,7 +348,10 @@ impl eframe::App for TraderApp {
         ctx.request_repaint();
 
         // Poll order status every 500ms if connected
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
         if now - self.last_poll_time > 0.5 {
             self.last_poll_time = now;
             let conn_status = self.state.connection_status.lock().unwrap().clone();
@@ -377,7 +380,8 @@ impl eframe::App for TraderApp {
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
                         *self.state.status_message.lock().unwrap() =
-                            "QuantSystem Trading Platform v1.0 - Full-Featured Dashboard".to_string();
+                            "QuantSystem Trading Platform v1.0 - Full-Featured Dashboard"
+                                .to_string();
                     }
                 });
             });
@@ -388,10 +392,18 @@ impl eframe::App for TraderApp {
             ui.horizontal(|ui| {
                 let conn_status = self.state.connection_status.lock().unwrap().clone();
                 let (color, text) = match conn_status {
-                    ConnectionStatus::Disconnected => (egui::Color32::GRAY, "● Disconnected".to_string()),
-                    ConnectionStatus::Connecting => (egui::Color32::YELLOW, "● Connecting...".to_string()),
-                    ConnectionStatus::Connected => (egui::Color32::GREEN, "● Connected".to_string()),
-                    ConnectionStatus::Error(msg) => (egui::Color32::RED, format!("● Error: {}", msg)),
+                    ConnectionStatus::Disconnected => {
+                        (egui::Color32::GRAY, "● Disconnected".to_string())
+                    }
+                    ConnectionStatus::Connecting => {
+                        (egui::Color32::YELLOW, "● Connecting...".to_string())
+                    }
+                    ConnectionStatus::Connected => {
+                        (egui::Color32::GREEN, "● Connected".to_string())
+                    }
+                    ConnectionStatus::Error(msg) => {
+                        (egui::Color32::RED, format!("● Error: {}", msg))
+                    }
                 };
                 ui.colored_label(color, text);
                 ui.separator();
@@ -402,7 +414,10 @@ impl eframe::App for TraderApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.colored_label(egui::Color32::GREEN, "🔴 LIVE (Binance)");
                     ui.separator();
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64();
                     ui.label(format!("Updated: {:.1}s ago", now - self.last_update));
                 });
             });
@@ -417,21 +432,22 @@ impl eframe::App for TraderApp {
             });
 
         // Main content area
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.current_page {
-                Page::Dashboard => self.render_dashboard(ui),
-                Page::Trading => self.render_trading_page(ui),
-                Page::MarketData => self.render_market_data_page(ui),
-                Page::PositionsOrders => self.render_positions_orders_page(ui),
-                Page::Backtesting => self.render_backtesting_page(ui),
-                Page::AdvancedAlgos => self.render_advanced_algos_page(ui),
-                Page::Analytics => self.render_analytics_page(ui),
-                Page::Logs => self.render_logs_page(ui),
-                Page::Settings => self.render_settings_page(ui),
-            }
+        egui::CentralPanel::default().show(ctx, |ui| match self.current_page {
+            Page::Dashboard => self.render_dashboard(ui),
+            Page::Trading => self.render_trading_page(ui),
+            Page::MarketData => self.render_market_data_page(ui),
+            Page::PositionsOrders => self.render_positions_orders_page(ui),
+            Page::Backtesting => self.render_backtesting_page(ui),
+            Page::AdvancedAlgos => self.render_advanced_algos_page(ui),
+            Page::Analytics => self.render_analytics_page(ui),
+            Page::Logs => self.render_logs_page(ui),
+            Page::Settings => self.render_settings_page(ui),
         });
 
-        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        self.last_update = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
     }
 }
 
@@ -496,7 +512,9 @@ impl TraderApp {
                 ui.set_min_width(ui.available_width());
                 let conn_status = self.state.connection_status.lock().unwrap().clone();
                 let (color, text) = match conn_status {
-                    ConnectionStatus::Connected => (egui::Color32::GREEN, "✓ Connected to Execution Engine"),
+                    ConnectionStatus::Connected => {
+                        (egui::Color32::GREEN, "✓ Connected to Execution Engine")
+                    }
                     ConnectionStatus::Connecting => (egui::Color32::YELLOW, "⟳ Connecting..."),
                     ConnectionStatus::Disconnected => (egui::Color32::GRAY, "○ Disconnected"),
                     ConnectionStatus::Error(ref msg) => (egui::Color32::RED, msg.as_str()),
@@ -517,9 +535,12 @@ impl TraderApp {
                             for (i, data) in market_data.iter().enumerate().take(5) {
                                 ui.horizontal(|ui| {
                                     ui.label(&data.symbol);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(format!("${:.2}", data.last));
-                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(format!("${:.2}", data.last));
+                                        },
+                                    );
                                 });
                                 if i < 4 && i < market_data.len() - 1 {
                                     ui.add_space(5.0);
@@ -545,14 +566,20 @@ impl TraderApp {
                             for pos in positions.iter().take(5) {
                                 ui.horizontal(|ui| {
                                     ui.label(&pos.symbol);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let color = if pos.unrealized_pnl >= 0.0 {
-                                            egui::Color32::GREEN
-                                        } else {
-                                            egui::Color32::RED
-                                        };
-                                        ui.colored_label(color, format!("${:.2}", pos.unrealized_pnl));
-                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let color = if pos.unrealized_pnl >= 0.0 {
+                                                egui::Color32::GREEN
+                                            } else {
+                                                egui::Color32::RED
+                                            };
+                                            ui.colored_label(
+                                                color,
+                                                format!("${:.2}", pos.unrealized_pnl),
+                                            );
+                                        },
+                                    );
                                 });
                                 ui.add_space(5.0);
                             }
@@ -580,9 +607,12 @@ impl TraderApp {
                                 };
                                 ui.horizontal(|ui| {
                                     ui.label(format!("#{}", order.order_id));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.colored_label(status_color, &order.status);
-                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.colored_label(status_color, &order.status);
+                                        },
+                                    );
                                 });
                                 ui.add_space(5.0);
                             }
@@ -606,11 +636,11 @@ impl TraderApp {
                             ui.label(egui::RichText::new(&data.symbol).strong());
                             ui.label(format!("${:.2} | Vol: {}", data.last, data.volume));
 
-                            let points: PlotPoints = data.price_history.iter()
-                                .map(|(t, p)| [*t, *p])
-                                .collect();
+                            let points: PlotPoints =
+                                data.price_history.iter().map(|(t, p)| [*t, *p]).collect();
 
-                            let line = Line::new(points).color(egui::Color32::from_rgb(0, 200, 100));
+                            let line =
+                                Line::new(points).color(egui::Color32::from_rgb(0, 200, 100));
 
                             Plot::new(format!("dash_chart_{}", data.symbol))
                                 .height(120.0)
@@ -680,7 +710,9 @@ impl TraderApp {
 
                     ui.horizontal(|ui| {
                         ui.colored_label(sentiment_color, "●");
-                        ui.label(egui::RichText::new(&item.headline).text_style(egui::TextStyle::Body));
+                        ui.label(
+                            egui::RichText::new(&item.headline).text_style(egui::TextStyle::Body),
+                        );
                     });
                     ui.label(egui::RichText::new(&item.timestamp).small().italics());
                     ui.separator();
@@ -740,26 +772,38 @@ impl TraderApp {
                         ui.label("Duration (sec):");
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.duration_sec);
-                            if ui.button("5s").clicked() { self.duration_sec = "5.0".to_string(); }
-                            if ui.button("10s").clicked() { self.duration_sec = "10.0".to_string(); }
-                            if ui.button("30s").clicked() { self.duration_sec = "30.0".to_string(); }
+                            if ui.button("5s").clicked() {
+                                self.duration_sec = "5.0".to_string();
+                            }
+                            if ui.button("10s").clicked() {
+                                self.duration_sec = "10.0".to_string();
+                            }
+                            if ui.button("30s").clicked() {
+                                self.duration_sec = "30.0".to_string();
+                            }
                         });
                         ui.end_row();
 
                         ui.label("Number of Slices:");
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.num_slices);
-                            if ui.button("5").clicked() { self.num_slices = "5".to_string(); }
-                            if ui.button("10").clicked() { self.num_slices = "10".to_string(); }
-                            if ui.button("20").clicked() { self.num_slices = "20".to_string(); }
+                            if ui.button("5").clicked() {
+                                self.num_slices = "5".to_string();
+                            }
+                            if ui.button("10").clicked() {
+                                self.num_slices = "10".to_string();
+                            }
+                            if ui.button("20").clicked() {
+                                self.num_slices = "20".to_string();
+                            }
                         });
                         ui.end_row();
 
                         ui.label("Algorithm:");
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut self.algo_type, AlgoType::TWAP, "TWAP");
-                            ui.radio_value(&mut self.algo_type, AlgoType::POV, "POV");
-                            ui.radio_value(&mut self.algo_type, AlgoType::VWAP, "VWAP");
+                            ui.radio_value(&mut self.algo_type, AlgoType::Twap, "TWAP");
+                            ui.radio_value(&mut self.algo_type, AlgoType::Pov, "POV");
+                            ui.radio_value(&mut self.algo_type, AlgoType::Vwap, "VWAP");
                             ui.radio_value(&mut self.algo_type, AlgoType::IS, "IS");
                         });
                         ui.end_row();
@@ -768,24 +812,38 @@ impl TraderApp {
                 ui.add_space(5.0);
 
                 let algo_desc = match self.algo_type {
-                    AlgoType::TWAP => "Time-Weighted Average Price: Splits order evenly over time",
-                    AlgoType::POV => "Percent of Volume: Executes based on market volume percentage",
-                    AlgoType::VWAP => "Volume-Weighted Average Price: Follows historical volume patterns",
+                    AlgoType::Twap => "Time-Weighted Average Price: Splits order evenly over time",
+                    AlgoType::Pov => {
+                        "Percent of Volume: Executes based on market volume percentage"
+                    }
+                    AlgoType::Vwap => {
+                        "Volume-Weighted Average Price: Follows historical volume patterns"
+                    }
                     AlgoType::IS => "Implementation Shortfall: Balances urgency vs market impact",
                 };
-                ui.label(egui::RichText::new(algo_desc).italics().color(egui::Color32::GRAY));
+                ui.label(
+                    egui::RichText::new(algo_desc)
+                        .italics()
+                        .color(egui::Color32::GRAY),
+                );
 
                 ui.add_space(10.0);
 
                 ui.horizontal(|ui| {
                     let button_text = format!("🚀 Submit {} Order", self.algo_type);
-                    if ui.add_sized([180.0, 45.0], egui::Button::new(button_text)).clicked() {
+                    if ui
+                        .add_sized([180.0, 45.0], egui::Button::new(button_text))
+                        .clicked()
+                    {
                         self.submit_order();
                     }
 
                     ui.add_space(10.0);
 
-                    if ui.add_sized([120.0, 45.0], egui::Button::new("🔄 Refresh")).clicked() {
+                    if ui
+                        .add_sized([120.0, 45.0], egui::Button::new("🔄 Refresh"))
+                        .clicked()
+                    {
                         self.refresh_data();
                     }
                 });
@@ -876,9 +934,8 @@ impl TraderApp {
                     ui.label(egui::RichText::new(&data.symbol).strong());
                     ui.label(format!("${:.2} | Vol: {}", data.last, data.volume));
 
-                    let points: PlotPoints = data.price_history.iter()
-                        .map(|(t, p)| [*t, *p])
-                        .collect();
+                    let points: PlotPoints =
+                        data.price_history.iter().map(|(t, p)| [*t, *p]).collect();
 
                     let line = Line::new(points).color(egui::Color32::from_rgb(0, 200, 100));
 
@@ -941,7 +998,10 @@ impl TraderApp {
                                     } else {
                                         egui::Color32::RED
                                     };
-                                    ui.colored_label(macd_color, format!("{:.2}/{:.2}", macd, signal));
+                                    ui.colored_label(
+                                        macd_color,
+                                        format!("{:.2}/{:.2}", macd, signal),
+                                    );
                                 } else {
                                     ui.label("-");
                                 }
@@ -952,7 +1012,11 @@ impl TraderApp {
                                     ui.label("-");
                                 }
 
-                                let age = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - ind.last_update;
+                                let age = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                                    - ind.last_update;
                                 ui.label(format!("{}s ago", age));
                                 ui.end_row();
                             }
@@ -1102,11 +1166,31 @@ impl TraderApp {
 
                         ui.label("Replay Speed:");
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut self.backtest_replay_speed, ReplaySpeed::RealTime, "Real-Time");
-                            ui.radio_value(&mut self.backtest_replay_speed, ReplaySpeed::FastForward2x, "2x");
-                            ui.radio_value(&mut self.backtest_replay_speed, ReplaySpeed::FastForward5x, "5x");
-                            ui.radio_value(&mut self.backtest_replay_speed, ReplaySpeed::FastForward10x, "10x");
-                            ui.radio_value(&mut self.backtest_replay_speed, ReplaySpeed::Maximum, "Max");
+                            ui.radio_value(
+                                &mut self.backtest_replay_speed,
+                                ReplaySpeed::RealTime,
+                                "Real-Time",
+                            );
+                            ui.radio_value(
+                                &mut self.backtest_replay_speed,
+                                ReplaySpeed::FastForward2x,
+                                "2x",
+                            );
+                            ui.radio_value(
+                                &mut self.backtest_replay_speed,
+                                ReplaySpeed::FastForward5x,
+                                "5x",
+                            );
+                            ui.radio_value(
+                                &mut self.backtest_replay_speed,
+                                ReplaySpeed::FastForward10x,
+                                "10x",
+                            );
+                            ui.radio_value(
+                                &mut self.backtest_replay_speed,
+                                ReplaySpeed::Maximum,
+                                "Max",
+                            );
                         });
                         ui.end_row();
                     });
@@ -1115,13 +1199,22 @@ impl TraderApp {
 
                 ui.horizontal(|ui| {
                     let start_enabled = !is_running;
-                    if ui.add_enabled(start_enabled, egui::Button::new("▶ Start Backtest")).clicked() {
+                    if ui
+                        .add_enabled(start_enabled, egui::Button::new("▶ Start Backtest"))
+                        .clicked()
+                    {
                         self.start_backtest();
                     }
-                    if ui.add_enabled(is_running, egui::Button::new("⏸ Pause")).clicked() {
+                    if ui
+                        .add_enabled(is_running, egui::Button::new("⏸ Pause"))
+                        .clicked()
+                    {
                         self.backtest_paused = !self.backtest_paused;
                     }
-                    if ui.add_enabled(is_running, egui::Button::new("⏹ Stop")).clicked() {
+                    if ui
+                        .add_enabled(is_running, egui::Button::new("⏹ Stop"))
+                        .clicked()
+                    {
                         self.stop_backtest();
                     }
                 });
@@ -1407,7 +1500,8 @@ impl TraderApp {
                 ui.heading("Equity Curve");
 
                 if !equity_curve.is_empty() {
-                    let points: PlotPoints = equity_curve.iter()
+                    let points: PlotPoints = equity_curve
+                        .iter()
                         .enumerate()
                         .map(|(i, p)| [i as f64, p.equity])
                         .collect();
@@ -1534,7 +1628,10 @@ impl TraderApp {
                         ui.end_row();
 
                         ui.strong("Winning Trades:");
-                        ui.colored_label(egui::Color32::GREEN, format!("{}", metrics.winning_trades));
+                        ui.colored_label(
+                            egui::Color32::GREEN,
+                            format!("{}", metrics.winning_trades),
+                        );
                         ui.end_row();
 
                         ui.strong("Losing Trades:");
@@ -1564,19 +1661,31 @@ impl TraderApp {
                         ui.end_row();
 
                         ui.strong("Average Win:");
-                        ui.colored_label(egui::Color32::GREEN, format!("${:.2}", metrics.average_win));
+                        ui.colored_label(
+                            egui::Color32::GREEN,
+                            format!("${:.2}", metrics.average_win),
+                        );
                         ui.end_row();
 
                         ui.strong("Average Loss:");
-                        ui.colored_label(egui::Color32::RED, format!("${:.2}", metrics.average_loss));
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            format!("${:.2}", metrics.average_loss),
+                        );
                         ui.end_row();
 
                         ui.strong("Largest Win:");
-                        ui.colored_label(egui::Color32::GREEN, format!("${:.2}", metrics.largest_win));
+                        ui.colored_label(
+                            egui::Color32::GREEN,
+                            format!("${:.2}", metrics.largest_win),
+                        );
                         ui.end_row();
 
                         ui.strong("Largest Loss:");
-                        ui.colored_label(egui::Color32::RED, format!("${:.2}", metrics.largest_loss));
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            format!("${:.2}", metrics.largest_loss),
+                        );
                         ui.end_row();
                     });
             });
@@ -1629,9 +1738,9 @@ impl TraderApp {
             ui.group(|ui| {
                 ui.heading("System Information");
                 ui.separator();
-                ui.label(format!("Platform: QuantSystem Trading Platform"));
-                ui.label(format!("Version: 1.0.0"));
-                ui.label(format!("Real-time data: Binance Public API"));
+                ui.label("Platform: QuantSystem Trading Platform".to_string());
+                ui.label("Version: 1.0.0".to_string());
+                ui.label("Real-time data: Binance Public API".to_string());
                 ui.label(format!("Execution Engine: gRPC @ {}", self.server_address));
             });
 
@@ -1691,22 +1800,29 @@ impl TraderApp {
                             let message_lower = log.message.to_lowercase();
                             let category_lower = log.category.to_lowercase();
 
-                            if !message_lower.contains(&filter_lower) && !category_lower.contains(&filter_lower) {
+                            if !message_lower.contains(&filter_lower)
+                                && !category_lower.contains(&filter_lower)
+                            {
                                 continue;
                             }
                         }
 
                         ui.horizontal(|ui| {
                             // Timestamp
-                            ui.label(egui::RichText::new(&log.timestamp)
-                                .color(egui::Color32::GRAY)
-                                .monospace());
+                            ui.label(
+                                egui::RichText::new(&log.timestamp)
+                                    .color(egui::Color32::GRAY)
+                                    .monospace(),
+                            );
 
                             // Category with color
-                            let category_color = egui::Color32::from_rgb(log.color[0], log.color[1], log.color[2]);
-                            ui.label(egui::RichText::new(format!("[{}]", &log.category))
-                                .color(category_color)
-                                .strong());
+                            let category_color =
+                                egui::Color32::from_rgb(log.color[0], log.color[1], log.color[2]);
+                            ui.label(
+                                egui::RichText::new(format!("[{}]", &log.category))
+                                    .color(category_color)
+                                    .strong(),
+                            );
 
                             // Message
                             ui.label(&log.message);
@@ -1715,7 +1831,6 @@ impl TraderApp {
                 }
             });
     }
-
 
     // ========================================================================
     // BACKTESTING & ADAPTIVE TWAP FUNCTIONS
@@ -1751,13 +1866,20 @@ impl TraderApp {
                 let total_events = price_history.len();
                 if total_events == 0 {
                     eprintln!("[BACKTEST] ❌ No market data available");
-                    state.backtest_results.lock().unwrap().push("No market data available for backtesting".to_string());
+                    state
+                        .backtest_results
+                        .lock()
+                        .unwrap()
+                        .push("No market data available for backtesting".to_string());
                     *state.backtest_running.lock().unwrap() = false;
                     return;
                 }
 
                 eprintln!("[BACKTEST] Processing {} price points...", total_events);
-                state.backtest_results.lock().unwrap().push(format!("Backtesting {} using {} price points", symbol, total_events));
+                state.backtest_results.lock().unwrap().push(format!(
+                    "Backtesting {} using {} price points",
+                    symbol, total_events
+                ));
 
                 // Simulate trades
                 let mut trades = 0;
@@ -1768,7 +1890,8 @@ impl TraderApp {
                 for (i, (_time, price)) in price_history.iter().enumerate() {
                     // Simple strategy: buy on dips, sell on peaks
                     if i > 0 {
-                        let prev_price = price_history.get(i - 1).map(|(_, p)| *p).unwrap_or(*price);
+                        let prev_price =
+                            price_history.get(i - 1).map(|(_, p)| *p).unwrap_or(*price);
                         let price_change = (price - prev_price) / prev_price;
 
                         if price_change < -0.001 && position == 0 {
@@ -1776,7 +1899,12 @@ impl TraderApp {
                             position = 100;
                             entry_price = *price;
                             trades += 1;
-                            eprintln!("[BACKTEST] Trade #{} - BUY 100 @ ${:.2} (dip: {:.2}%)", trades, price, price_change * 100.0);
+                            eprintln!(
+                                "[BACKTEST] Trade #{} - BUY 100 @ ${:.2} (dip: {:.2}%)",
+                                trades,
+                                price,
+                                price_change * 100.0
+                            );
                         } else if price_change > 0.001 && position > 0 {
                             // Sell signal
                             let pnl = (price - entry_price) * position as f64;
@@ -1793,16 +1921,28 @@ impl TraderApp {
 
                     // Speed control
                     match speed {
-                        ReplaySpeed::RealTime => thread::sleep(std::time::Duration::from_millis(100)),
-                        ReplaySpeed::FastForward2x => thread::sleep(std::time::Duration::from_millis(50)),
-                        ReplaySpeed::FastForward5x => thread::sleep(std::time::Duration::from_millis(20)),
-                        ReplaySpeed::FastForward10x => thread::sleep(std::time::Duration::from_millis(10)),
+                        ReplaySpeed::RealTime => {
+                            thread::sleep(std::time::Duration::from_millis(100))
+                        }
+                        ReplaySpeed::FastForward2x => {
+                            thread::sleep(std::time::Duration::from_millis(50))
+                        }
+                        ReplaySpeed::FastForward5x => {
+                            thread::sleep(std::time::Duration::from_millis(20))
+                        }
+                        ReplaySpeed::FastForward10x => {
+                            thread::sleep(std::time::Duration::from_millis(10))
+                        }
                         ReplaySpeed::Maximum => {}
                     }
                 }
 
                 // Calculate metrics
-                let win_rate = if trades > 0 { (total_pnl > 0.0) as i32 as f64 / (trades / 2) as f64 } else { 0.0 };
+                let win_rate = if trades > 0 {
+                    (total_pnl > 0.0) as i32 as f64 / (trades / 2) as f64
+                } else {
+                    0.0
+                };
 
                 eprintln!("\n[BACKTEST] ✅ Backtest Complete!");
                 eprintln!("  Total Events: {}", total_events);
@@ -1811,24 +1951,36 @@ impl TraderApp {
                 eprintln!("  Win Rate: {:.1}%", win_rate * 100.0);
                 eprintln!("========================================\n");
 
-                log_message(&state, "BACKTEST", &format!("✅ Backtest complete: {} trades, P&L: ${:.2}",
-                    trades, total_pnl));
+                log_message(
+                    &state,
+                    "BACKTEST",
+                    &format!(
+                        "✅ Backtest complete: {} trades, P&L: ${:.2}",
+                        trades, total_pnl
+                    ),
+                );
 
                 let mut results = state.backtest_results.lock().unwrap();
                 results.clear();
                 results.push(format!("✓ Backtest completed for {}", symbol));
-                results.push(format!(""));
+                results.push(String::new());
                 results.push(format!("Total Events: {}", total_events));
                 results.push(format!("Total Trades: {}", trades));
                 results.push(format!("Total P&L: ${:.2}", total_pnl));
                 results.push(format!("Win Rate: {:.1}%", win_rate * 100.0));
-                results.push(format!(""));
-                results.push(format!("Strategy: Simple momentum (buy dips, sell peaks)"));
-                results.push(format!("Note: This is a simplified simulation using collected market data"));
+                results.push(String::new());
+                results.push("Strategy: Simple momentum (buy dips, sell peaks)".to_string());
+                results.push(
+                    "Note: This is a simplified simulation using collected market data".to_string(),
+                );
             } else {
                 eprintln!("[BACKTEST] ❌ No data found for symbol {}", symbol);
                 drop(market_data);
-                state.backtest_results.lock().unwrap().push(format!("No data found for symbol {}", symbol));
+                state
+                    .backtest_results
+                    .lock()
+                    .unwrap()
+                    .push(format!("No data found for symbol {}", symbol));
             }
 
             *state.backtest_running.lock().unwrap() = false;
@@ -1867,7 +2019,14 @@ impl TraderApp {
         eprintln!("  Duration: {}s", duration_secs);
         eprintln!("  Base Slice: {}s", base_slice_secs);
         eprintln!("  Total Slices: {}", num_slices);
-        eprintln!("  Adaptive: {}", if enable_adaptive { "ENABLED" } else { "DISABLED" });
+        eprintln!(
+            "  Adaptive: {}",
+            if enable_adaptive {
+                "ENABLED"
+            } else {
+                "DISABLED"
+            }
+        );
         eprintln!("  Volatility Window: {}", volatility_window);
         eprintln!("  Max Participation: {:.1}%", max_participation * 100.0);
 
@@ -1880,7 +2039,9 @@ impl TraderApp {
             eprintln!("[ADAPTIVE TWAP] ⚠️  WARNING: Not connected to execution engine");
             eprintln!("                Running in SIMULATION mode");
         } else {
-            eprintln!("[ADAPTIVE TWAP] ✅ Connected to execution engine - REAL orders will be submitted");
+            eprintln!(
+                "[ADAPTIVE TWAP] ✅ Connected to execution engine - REAL orders will be submitted"
+            );
         }
 
         *state.adaptive_twap_running.lock().unwrap() = true;
@@ -1888,8 +2049,14 @@ impl TraderApp {
         state.adaptive_child_orders.lock().unwrap().clear();
         *state.status_message.lock().unwrap() = "Starting Adaptive TWAP execution...".to_string();
 
-        log_message(&state, "ADAPTIVE TWAP", &format!("▶️ Starting Adaptive TWAP: {} {} {} over {}s",
-            side, total_qty, symbol, duration_secs));
+        log_message(
+            &state,
+            "ADAPTIVE TWAP",
+            &format!(
+                "▶️ Starting Adaptive TWAP: {} {} {} over {}s",
+                side, total_qty, symbol, duration_secs
+            ),
+        );
 
         thread::spawn(move || {
             let num_slices = (duration_secs / base_slice_secs) as usize;
@@ -1905,7 +2072,8 @@ impl TraderApp {
 
             if data.is_none() {
                 eprintln!("[ADAPTIVE TWAP] ❌ No market data for symbol {}", symbol);
-                *state.status_message.lock().unwrap() = format!("No market data for symbol {}", symbol);
+                *state.status_message.lock().unwrap() =
+                    format!("No market data for symbol {}", symbol);
                 *state.adaptive_twap_running.lock().unwrap() = false;
                 return;
             }
@@ -1929,7 +2097,9 @@ impl TraderApp {
                 // Apply adaptive logic if enabled
                 let mut vol_adjustment = 1.0;
                 if enable_adaptive && data.price_history.len() >= volatility_window {
-                    let recent_prices: Vec<f64> = data.price_history.iter()
+                    let recent_prices: Vec<f64> = data
+                        .price_history
+                        .iter()
                         .rev()
                         .take(volatility_window)
                         .map(|(_, p)| *p)
@@ -1937,15 +2107,15 @@ impl TraderApp {
 
                     // Calculate volatility
                     if recent_prices.len() >= 2 {
-                        let returns: Vec<f64> = recent_prices.iter()
+                        let returns: Vec<f64> = recent_prices
+                            .iter()
                             .zip(recent_prices.iter().skip(1))
                             .map(|(p1, p2)| (p2 / p1).ln())
                             .collect();
 
                         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-                        let variance = returns.iter()
-                            .map(|r| (r - mean).powi(2))
-                            .sum::<f64>() / returns.len() as f64;
+                        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
+                            / returns.len() as f64;
                         let volatility = variance.sqrt();
 
                         // Adjust slice based on volatility
@@ -1956,7 +2126,10 @@ impl TraderApp {
                             eprintln!("[ADAPTIVE TWAP] MEDIUM volatility detected ({:.3}%), reducing slice by 10%", volatility * 100.0);
                             0.9
                         } else {
-                            eprintln!("[ADAPTIVE TWAP] NORMAL volatility ({:.3}%)", volatility * 100.0);
+                            eprintln!(
+                                "[ADAPTIVE TWAP] NORMAL volatility ({:.3}%)",
+                                volatility * 100.0
+                            );
                             1.0
                         };
 
@@ -1967,7 +2140,11 @@ impl TraderApp {
                 slice_qty = slice_qty.max(1).min(remaining_qty);
 
                 eprintln!("[ADAPTIVE TWAP] Slice #{}/{}", slice_num + 1, num_slices);
-                eprintln!("  Quantity: {} (adjustment: {:.0}%)", slice_qty, vol_adjustment * 100.0);
+                eprintln!(
+                    "  Quantity: {} (adjustment: {:.0}%)",
+                    slice_qty,
+                    vol_adjustment * 100.0
+                );
                 eprintln!("  Remaining: {}/{}", remaining_qty, total_qty);
 
                 if use_real_orders {
@@ -1979,7 +2156,10 @@ impl TraderApp {
                     let side_str = format!("{}", side);
 
                     let result = runtime.block_on(async {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as u64;
                         let request = ParentOrderRequest {
                             symbol: symbol.clone(),
                             side: side_str.clone(),
@@ -1998,8 +2178,17 @@ impl TraderApp {
                             let resp = response.into_inner();
                             eprintln!("  ✅ Order #{} ACCEPTED", resp.parent_order_id);
 
-                            log_message(&state, "ADAPTIVE TWAP", &format!("📋 Slice {}/{} submitted: Order #{} for {} qty",
-                                slice_num + 1, num_slices, resp.parent_order_id, slice_qty));
+                            log_message(
+                                &state,
+                                "ADAPTIVE TWAP",
+                                &format!(
+                                    "📋 Slice {}/{} submitted: Order #{} for {} qty",
+                                    slice_num + 1,
+                                    num_slices,
+                                    resp.parent_order_id,
+                                    slice_qty
+                                ),
+                            );
 
                             let order = OrderInfo {
                                 order_id: resp.parent_order_id,
@@ -2011,14 +2200,26 @@ impl TraderApp {
                                 submitted_at: chrono::Local::now().format("%H:%M:%S").to_string(),
                             };
 
-                            state.adaptive_child_orders.lock().unwrap().push(order.clone());
+                            state
+                                .adaptive_child_orders
+                                .lock()
+                                .unwrap()
+                                .push(order.clone());
                             state.orders.lock().unwrap().insert(0, order);
                             filled_qty += slice_qty;
                         }
                         Err(e) => {
                             eprintln!("  ❌ Order submission FAILED: {}", e);
-                            log_message(&state, "ERROR", &format!("❌ TWAP slice {}/{} failed: {}",
-                                slice_num + 1, num_slices, e));
+                            log_message(
+                                &state,
+                                "ERROR",
+                                &format!(
+                                    "❌ TWAP slice {}/{} failed: {}",
+                                    slice_num + 1,
+                                    num_slices,
+                                    e
+                                ),
+                            );
                         }
                     }
                 } else {
@@ -2061,10 +2262,19 @@ impl TraderApp {
             eprintln!("  Total Slices: {}", num_slices);
             eprintln!("========================================\n");
 
-            log_message(&state, "ADAPTIVE TWAP", &format!("✅ Execution complete: {}/{} filled in {} slices",
-                filled_qty, total_qty, num_slices));
+            log_message(
+                &state,
+                "ADAPTIVE TWAP",
+                &format!(
+                    "✅ Execution complete: {}/{} filled in {} slices",
+                    filled_qty, total_qty, num_slices
+                ),
+            );
 
-            *state.status_message.lock().unwrap() = format!("Adaptive TWAP completed: {}/{} filled", filled_qty, total_qty);
+            *state.status_message.lock().unwrap() = format!(
+                "Adaptive TWAP completed: {}/{} filled",
+                filled_qty, total_qty
+            );
             *state.adaptive_twap_running.lock().unwrap() = false;
         });
     }
@@ -2100,7 +2310,11 @@ impl TraderApp {
                     eprintln!("  Status: READY");
                     eprintln!("========================================\n");
 
-                    log_message(&state, "CONNECTION", &format!("✅ Connected to {} via gRPC", server_addr));
+                    log_message(
+                        &state,
+                        "CONNECTION",
+                        &format!("✅ Connected to {} via gRPC", server_addr),
+                    );
 
                     *state.grpc_client.lock().unwrap() = Some(client);
                     *state.connection_status.lock().unwrap() = ConnectionStatus::Connected;
@@ -2113,9 +2327,14 @@ impl TraderApp {
                     eprintln!("  Hint: Make sure the execution engine is running");
                     eprintln!("========================================\n");
 
-                    log_message(&state, "ERROR", &format!("❌ Connection to {} failed: {}", server_addr, e));
+                    log_message(
+                        &state,
+                        "ERROR",
+                        &format!("❌ Connection to {} failed: {}", server_addr, e),
+                    );
 
-                    *state.connection_status.lock().unwrap() = ConnectionStatus::Error(format!("Connection failed: {}", e));
+                    *state.connection_status.lock().unwrap() =
+                        ConnectionStatus::Error(format!("Connection failed: {}", e));
                     *state.status_message.lock().unwrap() = format!("Failed to connect: {}", e);
                 }
             }
@@ -2128,7 +2347,7 @@ impl TraderApp {
     }
 
     fn poll_order_status(&self) {
-        use api::proto::{OrderStatusRequest};
+        use api::proto::OrderStatusRequest;
 
         let client_opt = self.state.grpc_client.lock().unwrap();
         if client_opt.is_none() {
@@ -2138,12 +2357,13 @@ impl TraderApp {
         drop(client_opt);
 
         let orders = self.state.orders.lock().unwrap();
-        let order_ids: Vec<u64> = orders.iter()
+        let order_ids: Vec<u64> = orders
+            .iter()
             .filter(|o| {
-                o.status == "WORKING" ||
-                o.status == "PENDING" ||
-                o.status == "ACCEPTED" ||
-                o.status == "PARTIALLY_FILLED"
+                o.status == "WORKING"
+                    || o.status == "PENDING"
+                    || o.status == "ACCEPTED"
+                    || o.status == "PARTIALLY_FILLED"
             })
             .map(|o| o.order_id)
             .collect();
@@ -2179,15 +2399,30 @@ impl TraderApp {
                         if old_status != resp.status || old_filled != resp.filled_qty {
                             eprintln!("\n[ORDER UPDATE] Order #{} Status Change", order_id);
                             eprintln!("  Status: {} -> {}", old_status, resp.status);
-                            eprintln!("  Filled: {} -> {}/{}", old_filled, resp.filled_qty, order.quantity);
+                            eprintln!(
+                                "  Filled: {} -> {}/{}",
+                                old_filled, resp.filled_qty, order.quantity
+                            );
 
                             if resp.status == "FILLED" {
                                 eprintln!("  ✅ ORDER FULLY FILLED!");
-                                log_message(&state, "ORDER UPDATE", &format!("✅ Order #{} FILLED: {}/{}",
-                                    order_id, resp.filled_qty, order.quantity));
+                                log_message(
+                                    &state,
+                                    "ORDER UPDATE",
+                                    &format!(
+                                        "✅ Order #{} FILLED: {}/{}",
+                                        order_id, resp.filled_qty, order.quantity
+                                    ),
+                                );
                             } else {
-                                log_message(&state, "ORDER UPDATE", &format!("Order #{} status: {} ({}/{})",
-                                    order_id, resp.status, resp.filled_qty, order.quantity));
+                                log_message(
+                                    &state,
+                                    "ORDER UPDATE",
+                                    &format!(
+                                        "Order #{} status: {} ({}/{})",
+                                        order_id, resp.status, resp.filled_qty, order.quantity
+                                    ),
+                                );
                             }
                         }
 
@@ -2277,7 +2512,10 @@ impl TraderApp {
             eprintln!("[TRADING] 📡 Sending order to execution engine via gRPC...");
 
             let result = runtime.block_on(async {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
                 let duration_ns = (duration * 1_000_000_000.0) as u64;
 
                 let request = ParentOrderRequest {
@@ -2309,8 +2547,14 @@ impl TraderApp {
                     eprintln!("  Qty: {}", qty);
                     eprintln!("========================================\n");
 
-                    log_message(&state, "TRADING", &format!("✅ Order #{} accepted: {} {} {} @ ${:.2}",
-                        resp.parent_order_id, side_str, qty, symbol, limit_price));
+                    log_message(
+                        &state,
+                        "TRADING",
+                        &format!(
+                            "✅ Order #{} accepted: {} {} {} @ ${:.2}",
+                            resp.parent_order_id, side_str, qty, symbol, limit_price
+                        ),
+                    );
 
                     let order = OrderInfo {
                         order_id: resp.parent_order_id,
@@ -2323,7 +2567,8 @@ impl TraderApp {
                     };
 
                     state.orders.lock().unwrap().insert(0, order);
-                    *state.status_message.lock().unwrap() = format!("Order {} {}", resp.parent_order_id, resp.status);
+                    *state.status_message.lock().unwrap() =
+                        format!("Order {} {}", resp.parent_order_id, resp.status);
                 }
                 Err(e) => {
                     eprintln!("\n[TRADING] ❌ Order Submission FAILED!");
@@ -2331,9 +2576,14 @@ impl TraderApp {
                     eprintln!("  This usually means the execution engine is not running");
                     eprintln!("========================================\n");
 
-                    log_message(&state, "ERROR", &format!("❌ Order submission failed: {}", e));
+                    log_message(
+                        &state,
+                        "ERROR",
+                        &format!("❌ Order submission failed: {}", e),
+                    );
 
-                    *state.status_message.lock().unwrap() = format!("Order submission failed: {}", e);
+                    *state.status_message.lock().unwrap() =
+                        format!("Order submission failed: {}", e);
                 }
             }
         });
@@ -2403,14 +2653,14 @@ fn log_message(state: &AppState, category: &str, message: &str) {
     };
 
     let color = match category {
-        "TRADING" => [100, 200, 100],      // Green
+        "TRADING" => [100, 200, 100],       // Green
         "ADAPTIVE TWAP" => [100, 150, 255], // Blue
-        "BACKTEST" => [255, 200, 100],     // Orange
-        "ORDER UPDATE" => [200, 200, 100], // Yellow
-        "CONNECTION" => [150, 100, 255],   // Purple
-        "PERFORMANCE" => [255, 150, 150],  // Pink
-        "ERROR" => [255, 100, 100],        // Red
-        _ => [200, 200, 200],              // Gray
+        "BACKTEST" => [255, 200, 100],      // Orange
+        "ORDER UPDATE" => [200, 200, 100],  // Yellow
+        "CONNECTION" => [150, 100, 255],    // Purple
+        "PERFORMANCE" => [255, 150, 150],   // Pink
+        "ERROR" => [255, 100, 100],         // Red
+        _ => [200, 200, 200],               // Gray
     };
 
     let entry = LogEntry {
@@ -2469,30 +2719,36 @@ struct BinanceTrade {
     trade_time: u64,
 }
 
-fn calculate_live_indicators(_symbol: &str, price_history: &VecDeque<(f64, f64)>) -> Option<LiveIndicators> {
+fn calculate_live_indicators(
+    _symbol: &str,
+    price_history: &VecDeque<(f64, f64)>,
+) -> Option<LiveIndicators> {
     if price_history.len() < 50 {
         return None;
     }
 
     let prices: Vec<f64> = price_history.iter().map(|(_, p)| *p).collect();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    let rsi = indicators::rsi(&prices, 14).ok()
+    let rsi = indicators::rsi(&prices, 14)
+        .ok()
         .and_then(|v| v.last().copied());
 
     let macd_result = indicators::macd(&prices, 12, 26, 9).ok();
-    let macd = macd_result.as_ref()
+    let macd = macd_result
+        .as_ref()
         .and_then(|m| m.macd_line.last().copied());
-    let macd_signal = macd_result.as_ref()
+    let macd_signal = macd_result
+        .as_ref()
         .and_then(|m| m.signal_line.last().copied());
 
     let bb_result = indicators::bollinger_bands(&prices, 20, 2.0).ok();
-    let bb_upper = bb_result.as_ref()
-        .and_then(|bb| bb.upper.last().copied());
-    let bb_middle = bb_result.as_ref()
-        .and_then(|bb| bb.middle.last().copied());
-    let bb_lower = bb_result.as_ref()
-        .and_then(|bb| bb.lower.last().copied());
+    let bb_upper = bb_result.as_ref().and_then(|bb| bb.upper.last().copied());
+    let bb_middle = bb_result.as_ref().and_then(|bb| bb.middle.last().copied());
+    let bb_lower = bb_result.as_ref().and_then(|bb| bb.lower.last().copied());
 
     Some(LiveIndicators {
         rsi,
@@ -2526,7 +2782,10 @@ fn update_performance_from_fills(state: &AppState) {
             };
 
             let trade = Trade {
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64,
                 symbol: order.symbol.clone(),
                 side: trade_type,
                 quantity: order.filled_qty as f64,
@@ -2541,7 +2800,10 @@ fn update_performance_from_fills(state: &AppState) {
 
     if trades_added > 0 {
         if let Ok(metrics) = analyzer.calculate_metrics() {
-            eprintln!("[GUI] Performance metrics updated: {} trades", metrics.total_trades);
+            eprintln!(
+                "[GUI] Performance metrics updated: {} trades",
+                metrics.total_trades
+            );
             *state.performance_metrics.lock().unwrap() = Some(metrics);
         }
         *state.equity_curve.lock().unwrap() = analyzer.get_equity_curve().to_vec();
@@ -2585,31 +2847,57 @@ fn start_realtime_data_fetcher(state: AppState) {
             }
 
             loop {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
 
                 for symbol in &symbols {
                     if let Ok(ticker_result) = client
-                        .get(format!("https://api.binance.com/api/v3/ticker/bookTicker?symbol={}", symbol))
+                        .get(format!(
+                            "https://api.binance.com/api/v3/ticker/bookTicker?symbol={}",
+                            symbol
+                        ))
                         .send()
                         .await
                     {
                         if let Ok(ticker) = ticker_result.json::<serde_json::Value>().await {
-                            let bid = ticker["bidPrice"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                            let ask = ticker["askPrice"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                            let bid = ticker["bidPrice"]
+                                .as_str()
+                                .unwrap_or("0")
+                                .parse::<f64>()
+                                .unwrap_or(0.0);
+                            let ask = ticker["askPrice"]
+                                .as_str()
+                                .unwrap_or("0")
+                                .parse::<f64>()
+                                .unwrap_or(0.0);
                             let last = (bid + ask) / 2.0;
 
                             if let Ok(ticker_24h_result) = client
-                                .get(format!("https://api.binance.com/api/v3/ticker/24hr?symbol={}", symbol))
+                                .get(format!(
+                                    "https://api.binance.com/api/v3/ticker/24hr?symbol={}",
+                                    symbol
+                                ))
                                 .send()
                                 .await
                             {
-                                if let Ok(ticker_24h) = ticker_24h_result.json::<serde_json::Value>().await {
-                                    let volume = ticker_24h["volume"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0) as u64;
+                                if let Ok(ticker_24h) =
+                                    ticker_24h_result.json::<serde_json::Value>().await
+                                {
+                                    let volume = ticker_24h["volume"]
+                                        .as_str()
+                                        .unwrap_or("0")
+                                        .parse::<f64>()
+                                        .unwrap_or(0.0)
+                                        as u64;
 
                                     let price_hist_clone;
                                     {
                                         let mut market_data = state.market_data.lock().unwrap();
-                                        if let Some(data) = market_data.iter_mut().find(|d| d.symbol == *symbol) {
+                                        if let Some(data) =
+                                            market_data.iter_mut().find(|d| d.symbol == *symbol)
+                                        {
                                             data.bid = bid;
                                             data.ask = ask;
                                             data.last = last;
@@ -2625,8 +2913,11 @@ fn start_realtime_data_fetcher(state: AppState) {
                                         }
                                     }
 
-                                    if let Some(indicators) = calculate_live_indicators(symbol, &price_hist_clone) {
-                                        let mut live_indicators = state.live_indicators.lock().unwrap();
+                                    if let Some(indicators) =
+                                        calculate_live_indicators(symbol, &price_hist_clone)
+                                    {
+                                        let mut live_indicators =
+                                            state.live_indicators.lock().unwrap();
                                         live_indicators.insert(symbol.to_string(), indicators);
                                     }
                                 }
@@ -2635,7 +2926,10 @@ fn start_realtime_data_fetcher(state: AppState) {
                     }
 
                     if let Ok(trades_result) = client
-                        .get(format!("https://api.binance.com/api/v3/trades?symbol={}&limit=5", symbol))
+                        .get(format!(
+                            "https://api.binance.com/api/v3/trades?symbol={}&limit=5",
+                            symbol
+                        ))
                         .send()
                         .await
                     {
@@ -2643,9 +2937,18 @@ fn start_realtime_data_fetcher(state: AppState) {
                             let mut transactions = state.transactions.lock().unwrap();
 
                             for trade in trades {
-                                let price = trade["price"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                                let qty = trade["qty"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                                let is_buyer_maker = trade["isBuyerMaker"].as_bool().unwrap_or(false);
+                                let price = trade["price"]
+                                    .as_str()
+                                    .unwrap_or("0")
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let qty = trade["qty"]
+                                    .as_str()
+                                    .unwrap_or("0")
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let is_buyer_maker =
+                                    trade["isBuyerMaker"].as_bool().unwrap_or(false);
 
                                 let trans = Transaction {
                                     symbol: symbol.to_string(),
@@ -2674,7 +2977,9 @@ fn start_realtime_data_fetcher(state: AppState) {
 
                     for data in market_data.iter() {
                         if data.price_history.len() >= 10 {
-                            let recent_prices: Vec<f64> = data.price_history.iter()
+                            let recent_prices: Vec<f64> = data
+                                .price_history
+                                .iter()
                                 .rev()
                                 .take(10)
                                 .map(|(_, p)| *p)
@@ -2687,15 +2992,21 @@ fn start_realtime_data_fetcher(state: AppState) {
                             if pct_change.abs() > 0.5 && news.len() < 20 {
                                 let (headline, sentiment) = if pct_change > 0.0 {
                                     (
-                                        format!("{} surges {:.2}% amid strong buying pressure",
-                                            data.symbol.replace("USDT", ""), pct_change),
-                                        "positive".to_string()
+                                        format!(
+                                            "{} surges {:.2}% amid strong buying pressure",
+                                            data.symbol.replace("USDT", ""),
+                                            pct_change
+                                        ),
+                                        "positive".to_string(),
                                     )
                                 } else {
                                     (
-                                        format!("{} drops {:.2}% on profit-taking",
-                                            data.symbol.replace("USDT", ""), pct_change.abs()),
-                                        "negative".to_string()
+                                        format!(
+                                            "{} drops {:.2}% on profit-taking",
+                                            data.symbol.replace("USDT", ""),
+                                            pct_change.abs()
+                                        ),
+                                        "negative".to_string(),
                                     )
                                 };
 
@@ -2714,7 +3025,8 @@ fn start_realtime_data_fetcher(state: AppState) {
                     }
                 }
 
-                *state.status_message.lock().unwrap() = "Live data streaming from Binance".to_string();
+                *state.status_message.lock().unwrap() =
+                    "Live data streaming from Binance".to_string();
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }

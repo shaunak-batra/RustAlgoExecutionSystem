@@ -44,13 +44,6 @@ env/
 *.swo
 *~
 
-# Proto generated files
-crates/api/src/proto/*.rs
-
-# Python generated proto
-python/algo_exec_py/*_pb2.py
-python/algo_exec_py/*_pb2_grpc.py
-
 # OS
 .DS_Store
 Thumbs.db

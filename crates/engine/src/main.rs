@@ -2,7 +2,6 @@ use api::start_grpc_server;
 use engine::{EngineCommand, ExecutionEngine};
 use tokio::sync::mpsc;
 use tracing::{info, Level};
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

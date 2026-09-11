@@ -5,30 +5,25 @@ build-backend = "maturin"
 [project]
 name = "algo-exec-py"
 version = "0.1.0"
-description = "Algorithmic execution engine with Python bindings"
-requires-python = ">=3.8"
+description = "Python bindings (PyO3) for the Rust execution-algorithm library"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
 ]
-dependencies = [
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
-    "numpy>=1.24.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.7.0",
-    "mypy>=1.5.0",
+test = [
+    "pytest>=7.4",
+    "hypothesis>=6.0",
 ]
 
 [tool.maturin]
+# Mixed layout: the pure-Python package `algo_exec_py/` ships with the compiled
+# extension installed inside it as `algo_exec_py._native`.
 python-source = "."
-module-name = "algo_exec_rs"
+module-name = "algo_exec_py._native"
 manifest-path = "../crates/python-bindings/Cargo.toml"
-features = []
+features = ["extension-module"]

@@ -76,17 +76,17 @@ pub fn compute_twap_schedule(params: TwapParams) -> Vec<ChildOrderInstruction> {
             let target_time_ns = params.start_ns + i as u64 * slice_duration_ns;
             // Distribute remainder to first slices
             let qty = base_qty + if i < remainder as usize { 1 } else { 0 };
-            ChildOrderInstruction { target_time_ns, qty }
+            ChildOrderInstruction {
+                target_time_ns,
+                qty,
+            }
         })
         .collect()
 }
 
 /// Variant: TWAP with randomized execution times within each slice window
 /// (for market impact reduction)
-pub fn compute_twap_randomized(
-    params: TwapParams,
-    seed: u64,
-) -> Vec<ChildOrderInstruction> {
+pub fn compute_twap_randomized(params: TwapParams, seed: u64) -> Vec<ChildOrderInstruction> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
 
@@ -291,7 +291,10 @@ mod tests {
             .zip(&schedule2)
             .all(|(a, b)| a.target_time_ns == b.target_time_ns);
 
-        assert!(!timings_equal, "Different seeds should produce different timings");
+        assert!(
+            !timings_equal,
+            "Different seeds should produce different timings"
+        );
 
         // But quantities should match
         for (a, b) in schedule1.iter().zip(&schedule2) {

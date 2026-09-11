@@ -46,7 +46,10 @@ impl ExecutionEngine {
 
     /// Run the main event loop.
     pub async fn run(mut self, mut cmd_rx: mpsc::Receiver<EngineCommand>) {
-        info!("Starting execution engine with {}ms tick interval", self.tick_interval_ms);
+        info!(
+            "Starting execution engine with {}ms tick interval",
+            self.tick_interval_ms
+        );
 
         let mut tick = interval(Duration::from_millis(self.tick_interval_ms));
 
@@ -165,7 +168,11 @@ impl ExecutionEngine {
                 "[TICK] now={} ns, pending_children={}, first_target={}",
                 now_ns,
                 self.state.pending_children.len(),
-                self.state.pending_children.first().map(|(t, _)| *t).unwrap_or(0)
+                self.state
+                    .pending_children
+                    .first()
+                    .map(|(t, _)| *t)
+                    .unwrap_or(0)
             );
         }
 
@@ -182,7 +189,9 @@ impl ExecutionEngine {
                 );
 
                 // Get the symbol for this order from its parent
-                let symbol = self.state.get_child_order(&order.id)
+                let symbol = self
+                    .state
+                    .get_child_order(&order.id)
                     .and_then(|child_info| self.state.get_parent_order(child_info.parent_id))
                     .map(|parent| parent.symbol.clone())
                     .unwrap_or_else(|| "UNKNOWN".to_string());
@@ -199,11 +208,7 @@ impl ExecutionEngine {
                     );
 
                     // Update position
-                    self.state.update_position(
-                        &symbol,
-                        &fill,
-                        order.side,
-                    );
+                    self.state.update_position(&symbol, &fill, order.side);
 
                     // Update child order status
                     if let Some(child_info) = self.state.get_child_order_mut(&fill.order_id) {
@@ -214,7 +219,8 @@ impl ExecutionEngine {
                     // Update parent order filled quantity
                     // Find parent ID from child order
                     if let Some(child_info) = self.state.get_child_order(&fill.order_id) {
-                        if let Some(parent) = self.state.get_parent_order_mut(child_info.parent_id) {
+                        if let Some(parent) = self.state.get_parent_order_mut(child_info.parent_id)
+                        {
                             parent.filled_qty = parent.filled_qty.saturating_add(fill.fill_qty);
 
                             // Update parent status
@@ -239,6 +245,7 @@ impl ExecutionEngine {
     }
 
     /// Handle submission of a parent order.
+    #[allow(clippy::too_many_arguments)]
     fn handle_submit_parent_order(
         &mut self,
         parent_id: u64,
@@ -272,7 +279,10 @@ impl ExecutionEngine {
         };
 
         // Risk checks
-        if let Err(e) = self.risk_checker.check_parent_order(&parent_order, &self.state) {
+        if let Err(e) = self
+            .risk_checker
+            .check_parent_order(&parent_order, &self.state)
+        {
             error!("Risk check failed for parent order {}: {}", parent_id, e);
             let mut rejected_order = parent_order;
             rejected_order.status = ParentOrderStatus::Rejected;
@@ -288,7 +298,11 @@ impl ExecutionEngine {
             num_slices,
         });
 
-        info!("Generated {} child orders for parent {}", schedule.len(), parent_id);
+        info!(
+            "Generated {} child orders for parent {}",
+            schedule.len(),
+            parent_id
+        );
 
         // Create child orders
         let mut child_order_ids = Vec::new();
@@ -302,7 +316,10 @@ impl ExecutionEngine {
         // Seed orderbook with market maker liquidity if not already seeded
         if needs_seeding {
             let mid_price = Price::from_f64(100.0);
-            info!("Seeding orderbook {} with market maker liquidity at price {}", symbol, mid_price.0);
+            info!(
+                "Seeding orderbook {} with market maker liquidity at price {}",
+                symbol, mid_price.0
+            );
             orderbook.seed_market_maker(mid_price, 10, Quantity::new(10000));
         }
 
@@ -311,13 +328,15 @@ impl ExecutionEngine {
             match side {
                 Side::Buy => {
                     // BUY orders: use best ask price (or higher to guarantee fill)
-                    orderbook.best_ask()
+                    orderbook
+                        .best_ask()
                         .map(|p| Price(p.0 + 100)) // Pay slightly above best ask
                         .unwrap_or(Price::from_f64(100.1))
                 }
                 Side::Sell => {
                     // SELL orders: use best bid price (or lower to guarantee fill)
-                    orderbook.best_bid()
+                    orderbook
+                        .best_bid()
                         .map(|p| Price(p.0 - 100)) // Sell slightly below best bid
                         .unwrap_or(Price::from_f64(99.9))
                 }
@@ -348,7 +367,9 @@ impl ExecutionEngine {
                 target_time_ns: instr.target_time_ns,
             });
 
-            self.state.pending_children.push((instr.target_time_ns, order));
+            self.state
+                .pending_children
+                .push((instr.target_time_ns, order));
             child_order_ids.push(child_id);
         }
 

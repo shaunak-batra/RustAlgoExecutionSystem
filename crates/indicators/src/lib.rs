@@ -28,13 +28,15 @@ pub fn sma(prices: &[f64], period: usize) -> Result<Vec<f64>> {
     }
 
     if period == 0 {
-        return Err(IndicatorError::InvalidPeriod("Period must be > 0".to_string()));
+        return Err(IndicatorError::InvalidPeriod(
+            "Period must be > 0".to_string(),
+        ));
     }
 
     let mut result = Vec::with_capacity(prices.len() - period + 1);
 
     for i in period - 1..prices.len() {
-        let sum: f64 = prices[i - period + 1..=i].iter().sum();
+        let sum: f64 = prices[i + 1 - period..=i].iter().sum();
         result.push(sum / period as f64);
     }
 
@@ -51,7 +53,9 @@ pub fn ema(prices: &[f64], period: usize) -> Result<Vec<f64>> {
     }
 
     if period == 0 {
-        return Err(IndicatorError::InvalidPeriod("Period must be > 0".to_string()));
+        return Err(IndicatorError::InvalidPeriod(
+            "Period must be > 0".to_string(),
+        ));
     }
 
     let multiplier = 2.0 / (period as f64 + 1.0);
@@ -62,9 +66,10 @@ pub fn ema(prices: &[f64], period: usize) -> Result<Vec<f64>> {
     result.push(first_sma);
 
     // Calculate EMA for remaining prices
-    for i in period..prices.len() {
-        let ema_val = (prices[i] - result.last().unwrap()) * multiplier + result.last().unwrap();
-        result.push(ema_val);
+    let mut prev = first_sma;
+    for &price in &prices[period..] {
+        prev += (price - prev) * multiplier;
+        result.push(prev);
     }
 
     Ok(result)
@@ -84,7 +89,9 @@ pub fn rsi(prices: &[f64], period: usize) -> Result<Vec<f64>> {
     }
 
     if period == 0 {
-        return Err(IndicatorError::InvalidPeriod("Period must be > 0".to_string()));
+        return Err(IndicatorError::InvalidPeriod(
+            "Period must be > 0".to_string(),
+        ));
     }
 
     let mut gains = Vec::new();
@@ -132,7 +139,18 @@ pub struct MacdResult {
     pub histogram: Vec<f64>,
 }
 
-pub fn macd(prices: &[f64], fast_period: usize, slow_period: usize, signal_period: usize) -> Result<MacdResult> {
+pub fn macd(
+    prices: &[f64],
+    fast_period: usize,
+    slow_period: usize,
+    signal_period: usize,
+) -> Result<MacdResult> {
+    if fast_period == 0 || signal_period == 0 || fast_period >= slow_period {
+        return Err(IndicatorError::InvalidPeriod(
+            "MACD requires 0 < fast_period < slow_period and signal_period > 0".to_string(),
+        ));
+    }
+
     if prices.len() < slow_period {
         return Err(IndicatorError::InsufficientData {
             required: slow_period,
@@ -185,8 +203,8 @@ pub fn bollinger_bands(prices: &[f64], period: usize, std_dev: f64) -> Result<Bo
     let mut lower = Vec::with_capacity(middle.len());
 
     for i in period - 1..prices.len() {
-        let slice = &prices[i - period + 1..=i];
-        let mean = middle[i - period + 1];
+        let slice = &prices[i + 1 - period..=i];
+        let mean = middle[i + 1 - period];
 
         // Calculate standard deviation
         let variance: f64 = slice.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / period as f64;
@@ -206,7 +224,9 @@ pub fn bollinger_bands(prices: &[f64], period: usize, std_dev: f64) -> Result<Bo
 /// Average True Range (ATR)
 pub fn atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<Vec<f64>> {
     if high.len() != low.len() || high.len() != close.len() {
-        return Err(IndicatorError::InvalidParameter("Price arrays must have equal length".to_string()));
+        return Err(IndicatorError::InvalidParameter(
+            "Price arrays must have equal length".to_string(),
+        ));
     }
 
     if high.len() < period + 1 {
@@ -230,8 +250,8 @@ pub fn atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<Ve
     let mut atr_val = tr[..period].iter().sum::<f64>() / period as f64;
     result.push(atr_val);
 
-    for i in period..tr.len() {
-        atr_val = (atr_val * (period - 1) as f64 + tr[i]) / period as f64;
+    for &true_range in &tr[period..] {
+        atr_val = (atr_val * (period - 1) as f64 + true_range) / period as f64;
         result.push(atr_val);
     }
 
@@ -245,7 +265,9 @@ pub fn atr(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Result<Ve
 /// On-Balance Volume (OBV)
 pub fn obv(close: &[f64], volume: &[f64]) -> Result<Vec<f64>> {
     if close.len() != volume.len() {
-        return Err(IndicatorError::InvalidParameter("Close and volume must have equal length".to_string()));
+        return Err(IndicatorError::InvalidParameter(
+            "Close and volume must have equal length".to_string(),
+        ));
     }
 
     if close.len() < 2 {
@@ -277,16 +299,12 @@ pub fn obv(close: &[f64], volume: &[f64]) -> Result<Vec<f64>> {
 
 /// Calculate returns from prices
 pub fn returns(prices: &[f64]) -> Vec<f64> {
-    prices.windows(2)
-        .map(|w| (w[1] - w[0]) / w[0])
-        .collect()
+    prices.windows(2).map(|w| (w[1] - w[0]) / w[0]).collect()
 }
 
 /// Calculate log returns from prices
 pub fn log_returns(prices: &[f64]) -> Vec<f64> {
-    prices.windows(2)
-        .map(|w| (w[1] / w[0]).ln())
-        .collect()
+    prices.windows(2).map(|w| (w[1] / w[0]).ln()).collect()
 }
 
 /// Calculate rolling standard deviation
@@ -301,7 +319,7 @@ pub fn rolling_std(prices: &[f64], period: usize) -> Result<Vec<f64>> {
     let mut result = Vec::with_capacity(prices.len() - period + 1);
 
     for i in period - 1..prices.len() {
-        let slice = &prices[i - period + 1..=i];
+        let slice = &prices[i + 1 - period..=i];
         let mean = slice.iter().sum::<f64>() / period as f64;
         let variance = slice.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / period as f64;
         result.push(variance.sqrt());
@@ -327,12 +345,15 @@ mod tests {
     #[test]
     fn test_rsi() {
         // Need at least period+2 prices to get 1 RSI value (period+1 changes, then calculate from period onwards)
-        let prices = vec![44.0, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03, 45.61, 46.28, 46.28, 46.50];
+        let prices = vec![
+            44.0, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03,
+            45.61, 46.28, 46.28, 46.50,
+        ];
         let result = rsi(&prices, 14).unwrap();
-        assert!(result.len() > 0);
+        assert!(!result.is_empty());
         // RSI should be between 0 and 100
         for r in result {
-            assert!(r >= 0.0 && r <= 100.0);
+            assert!((0.0..=100.0).contains(&r));
         }
     }
 
@@ -340,9 +361,9 @@ mod tests {
     fn test_macd() {
         let prices: Vec<f64> = (0..100).map(|x| 100.0 + (x as f64 * 0.1)).collect();
         let result = macd(&prices, 12, 26, 9).unwrap();
-        assert!(result.macd_line.len() > 0);
-        assert!(result.signal_line.len() > 0);
-        assert!(result.histogram.len() > 0);
+        assert!(!result.macd_line.is_empty());
+        assert!(!result.signal_line.is_empty());
+        assert!(!result.histogram.is_empty());
     }
 
     #[test]

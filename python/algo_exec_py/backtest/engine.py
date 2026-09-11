@@ -1,15 +1,9 @@
 """Backtest engine using Rust FFI bindings for TWAP execution."""
 
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 import bisect
 
-# Import the Rust module (will be available after maturin build)
-try:
-    import algo_exec_rs
-    HAS_FFI = True
-except ImportError:
-    HAS_FFI = False
-    print("Warning: algo_exec_rs not found. Run 'maturin develop' to build the Rust extension.")
+from algo_exec_py import compute_twap_py, compute_twap_randomized_py
 
 
 class BacktestEngine:
@@ -22,9 +16,6 @@ class BacktestEngine:
         Args:
             price_path: List of (timestamp_ns, price) tuples representing market prices
         """
-        if not HAS_FFI:
-            raise RuntimeError("Rust FFI module not available. Build with maturin first.")
-
         self.price_path = sorted(price_path, key=lambda x: x[0])
         self.fills: List[Dict[str, Any]] = []
         self.slippage_bps: List[float] = []
@@ -51,7 +42,7 @@ class BacktestEngine:
             List of fill dictionaries
         """
         # Compute TWAP schedule using Rust FFI
-        schedule = algo_exec_rs.compute_twap_py(start_ns, end_ns, total_qty, num_slices)
+        schedule = compute_twap_py(start_ns, end_ns, total_qty, num_slices)
 
         self.fills = []
 
@@ -99,9 +90,7 @@ class BacktestEngine:
             List of fill dictionaries
         """
         # Compute randomized TWAP schedule using Rust FFI
-        schedule = algo_exec_rs.compute_twap_randomized_py(
-            start_ns, end_ns, total_qty, num_slices, seed
-        )
+        schedule = compute_twap_randomized_py(start_ns, end_ns, total_qty, num_slices, seed)
 
         self.fills = []
 
@@ -123,7 +112,7 @@ class BacktestEngine:
 
         return self.fills
 
-    def _interpolate_price(self, target_ns: int) -> float | None:
+    def _interpolate_price(self, target_ns: int) -> Optional[float]:
         """
         Interpolate price at target time from price path.
 
@@ -188,11 +177,6 @@ if __name__ == "__main__":
 
     print("Backtest Engine Example")
 
-    if not HAS_FFI:
-        print("ERROR: Rust FFI module not available.")
-        print("Run: cd python && maturin develop --release")
-        exit(1)
-
     # Generate synthetic price path (10 seconds of data at 100ms intervals)
     start_time = int(time.time() * 1e9)
     price_path = [
@@ -218,7 +202,7 @@ if __name__ == "__main__":
         print(f"  Time: {fill['time_ns']}, Qty: {fill['qty']}, Price: {fill['price']:.2f}")
 
     metrics = engine.calculate_metrics()
-    print(f"\nMetrics:")
+    print("\nMetrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:.4f}")
 

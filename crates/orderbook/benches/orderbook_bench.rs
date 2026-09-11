@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use orderbook::{Order, OrderBook, OrderId, Price, Quantity, Side, Timestamp};
 
 fn create_order(id: u64, side: Side, price: f64, qty: u64) -> Order {
@@ -27,7 +27,8 @@ fn bench_order_insertion(c: &mut Criterion) {
 
                 // Insert sell orders
                 for i in 0..size {
-                    let order = create_order((size + i) as u64, Side::Sell, 101.0 + i as f64 * 0.01, 10);
+                    let order =
+                        create_order((size + i) as u64, Side::Sell, 101.0 + i as f64 * 0.01, 10);
                     book.insert_order(black_box(order));
                 }
             });
@@ -99,7 +100,12 @@ fn bench_best_bid_ask(c: &mut Criterion) {
     // Populate book with orders
     for i in 0..100 {
         book.insert_order(create_order(i, Side::Buy, 99.0 - i as f64 * 0.01, 10));
-        book.insert_order(create_order(i + 100, Side::Sell, 101.0 + i as f64 * 0.01, 10));
+        book.insert_order(create_order(
+            i + 100,
+            Side::Sell,
+            101.0 + i as f64 * 0.01,
+            10,
+        ));
     }
 
     c.bench_function("best_bid_ask_query", |b| {

@@ -1,18 +1,15 @@
 [workspace]
 members = [
-    "crates/algo-core",
     "crates/orderbook",
+    "crates/algo-core",
     "crates/engine",
     "crates/api",
+    "crates/config",
+    "crates/analytics",
+    "crates/indicators",
+    "crates/backtesting",
     "crates/python-bindings",
     "crates/trader-gui",
-    "crates/database",
-    "crates/config",
-    "crates/market-data",
-    "crates/indicators",
-    "crates/analytics",
-    "crates/backtesting",
-    "crates/strategies",
 ]
 resolver = "2"
 
@@ -24,14 +21,17 @@ tokio = { version = "1.41", features = ["full"] }
 tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
+# Bundled protoc so a fresh clone builds without a system protobuf install
+protoc-bin-vendored = "3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
-# Python bindings
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# Python bindings. `extension-module` is enabled only when building the wheel
+# (see python/pyproject.toml) so `cargo test` links on every platform.
+pyo3 = "0.22"
 
 # Error handling
 thiserror = "2.0"
@@ -41,7 +41,7 @@ anyhow = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 
-# GUI (optional)
+# GUI
 eframe = "0.29"
 egui = "0.29"
 
