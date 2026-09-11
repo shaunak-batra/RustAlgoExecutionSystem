@@ -1,309 +1,246 @@
-use crate::state::EngineState;
-use api::ParentOrder;
+//! Pre-trade risk limits and the loss kill switch.
+
+use crate::accounting::TickValue;
 use orderbook::{Price, Side};
 use thiserror::Error;
 
-// Risk limit constants
-const DEFAULT_MAX_POSITION: u64 = 1_000_000;
-const DEFAULT_MAX_ORDER_SIZE: u64 = 100_000;
-const DEFAULT_MAX_ORDER_NOTIONAL: f64 = 10_000_000.0;
-const DEFAULT_MAX_TOTAL_NOTIONAL: f64 = 50_000_000.0;
-const DEFAULT_MIN_PRICE: f64 = 0.01;
-const DEFAULT_MAX_PRICE: f64 = 1_000_000.0;
-
-/// Risk check errors.
-#[derive(Debug, Error)]
-pub enum RiskError {
-    #[error("Position limit exceeded: current={current}, limit={limit}")]
-    PositionLimitExceeded { current: i64, limit: i64 },
-
-    #[error("Notional limit exceeded: value={value:.2}, limit={limit:.2}")]
-    NotionalLimitExceeded { value: f64, limit: f64 },
-
-    #[error("Order size too large: size={size}, max={max}")]
-    OrderSizeTooLarge { size: u64, max: u64 },
-
-    #[error("Invalid price: {reason}")]
-    InvalidPrice { reason: String },
-
-    #[error("Market closed or outside trading hours")]
-    MarketClosed,
-
-    #[error("Insufficient capital")]
-    InsufficientCapital,
+/// Risk limits. Notional and P&L amounts are in price ticks × units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskLimits {
+    /// Largest quantity of a single parent order.
+    pub max_order_qty: u64,
+    /// Largest notional of a single parent order, priced at the worse (higher)
+    /// of its limit price and the mid.
+    pub max_order_notional: TickValue,
+    /// Largest absolute position per symbol, assuming every working order fills.
+    pub max_position_qty: u64,
+    /// Largest gross exposure across symbols, including the new order:
+    /// the sum of (|position| + unfilled working quantity) × mid.
+    pub max_gross_notional: TickValue,
+    /// A limit price may differ from the mid by at most this many basis points.
+    pub price_collar_bps: u32,
+    /// Trading halts once total P&L (realized plus unrealized at the mid) is
+    /// at or below `-max_loss`.
+    pub max_loss: TickValue,
 }
 
-/// Risk configuration.
-#[derive(Debug, Clone)]
-pub struct RiskConfig {
-    /// Maximum absolute position size per symbol
-    pub max_position: u64,
-
-    /// Maximum notional value per order (in dollars)
-    pub max_order_notional: f64,
-
-    /// Maximum single order size
-    pub max_order_size: u64,
-
-    /// Maximum total notional exposure across all positions
-    pub max_total_notional: f64,
-
-    /// Minimum price (for sanity checks)
-    pub min_price: Price,
-
-    /// Maximum price (for sanity checks)
-    pub max_price: Price,
+/// Exposure in one symbol, as used by the pre-trade checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolExposure {
+    pub position: i64,
+    /// Unfilled quantity of working buy orders.
+    pub working_buy_qty: u64,
+    /// Unfilled quantity of working sell orders.
+    pub working_sell_qty: u64,
+    pub mid: Price,
 }
 
-impl Default for RiskConfig {
-    fn default() -> Self {
-        Self {
-            max_position: DEFAULT_MAX_POSITION,
-            max_order_notional: DEFAULT_MAX_ORDER_NOTIONAL,
-            max_order_size: DEFAULT_MAX_ORDER_SIZE,
-            max_total_notional: DEFAULT_MAX_TOTAL_NOTIONAL,
-            min_price: Price::from_f64(DEFAULT_MIN_PRICE),
-            max_price: Price::from_f64(DEFAULT_MAX_PRICE),
-        }
-    }
+/// Why a new order failed a pre-trade check.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RiskViolation {
+    #[error("quantity {qty} exceeds the per-order limit of {limit}")]
+    OrderQuantity { qty: u64, limit: u64 },
+    #[error("limit price {limit_price} is more than {collar_bps} bps from the mid {mid}")]
+    PriceCollar {
+        limit_price: Price,
+        mid: Price,
+        collar_bps: u32,
+    },
+    #[error("notional {notional} exceeds the per-order limit of {limit} (ticks x units)")]
+    OrderNotional {
+        notional: TickValue,
+        limit: TickValue,
+    },
+    #[error("the position could reach {worst_case}, beyond the limit of {limit} either way")]
+    PositionLimit { worst_case: i128, limit: u64 },
+    #[error("gross exposure could reach {gross}, beyond the limit of {limit} (ticks x units)")]
+    GrossNotional { gross: TickValue, limit: TickValue },
 }
 
-pub struct RiskChecker {
-    config: RiskConfig,
-}
-
-impl RiskChecker {
-    pub fn new(config: RiskConfig) -> Self {
-        Self { config }
-    }
-
-    /// Pre-trade risk checks for a parent order.
-    pub fn check_parent_order(
+impl RiskLimits {
+    /// Pre-trade checks for a new parent order. `exposure` is the order's
+    /// symbol; `gross_notional` is the current gross exposure across all
+    /// symbols, before this order.
+    pub fn check_new_order(
         &self,
-        order: &ParentOrder,
-        state: &EngineState,
-    ) -> Result<(), RiskError> {
-        // Check order size
-        if order.total_qty.value() > self.config.max_order_size {
-            return Err(RiskError::OrderSizeTooLarge {
-                size: order.total_qty.value(),
-                max: self.config.max_order_size,
+        side: Side,
+        qty: u64,
+        limit_price: Option<Price>,
+        exposure: SymbolExposure,
+        gross_notional: TickValue,
+    ) -> Result<(), RiskViolation> {
+        if qty > self.max_order_qty {
+            return Err(RiskViolation::OrderQuantity {
+                qty,
+                limit: self.max_order_qty,
             });
         }
 
-        // Check notional value
-        if let Some(price) = order.limit_price {
-            let notional = price.as_f64() * order.total_qty.value() as f64;
-            if notional > self.config.max_order_notional {
-                return Err(RiskError::NotionalLimitExceeded {
-                    value: notional,
-                    limit: self.config.max_order_notional,
-                });
-            }
+        let mid = TickValue::from(exposure.mid.ticks());
+        let qty_value = TickValue::from(qty);
 
-            // Check price sanity
-            if price < self.config.min_price || price > self.config.max_price {
-                return Err(RiskError::InvalidPrice {
-                    reason: format!(
-                        "Price {} is outside allowed range [{}, {}]",
-                        price, self.config.min_price, self.config.max_price
-                    ),
+        if let Some(limit_price) = limit_price {
+            let distance = (TickValue::from(limit_price.ticks()) - mid).abs();
+            if distance * 10_000 > TickValue::from(self.price_collar_bps) * mid {
+                return Err(RiskViolation::PriceCollar {
+                    limit_price,
+                    mid: exposure.mid,
+                    collar_bps: self.price_collar_bps,
                 });
             }
         }
 
-        // Check position limit
-        if let Some(current_pos) = state.get_position(&order.symbol) {
-            let new_pos = match order.side {
-                Side::Buy => current_pos.quantity + order.total_qty.value() as i64,
-                Side::Sell => current_pos.quantity - order.total_qty.value() as i64,
-            };
-
-            if new_pos.abs() > self.config.max_position as i64 {
-                return Err(RiskError::PositionLimitExceeded {
-                    current: new_pos,
-                    limit: self.config.max_position as i64,
-                });
-            }
-        } else {
-            // No existing position, check new position against limit
-            if order.total_qty.value() > self.config.max_position {
-                return Err(RiskError::PositionLimitExceeded {
-                    current: order.total_qty.value() as i64,
-                    limit: self.config.max_position as i64,
-                });
-            }
+        let worst_price = limit_price.map_or(mid, |price| TickValue::from(price.ticks()).max(mid));
+        let notional = qty_value.saturating_mul(worst_price);
+        if notional > self.max_order_notional {
+            return Err(RiskViolation::OrderNotional {
+                notional,
+                limit: self.max_order_notional,
+            });
         }
 
-        // Check total notional exposure
-        let total_notional: f64 = state
-            .positions
-            .values()
-            .map(|p| p.avg_price * p.quantity.abs() as f64)
-            .sum();
+        let position = i128::from(exposure.position);
+        let worst_case = match side {
+            Side::Buy => position + i128::from(exposure.working_buy_qty) + qty_value,
+            Side::Sell => position - i128::from(exposure.working_sell_qty) - qty_value,
+        };
+        if worst_case.abs() > i128::from(self.max_position_qty) {
+            return Err(RiskViolation::PositionLimit {
+                worst_case,
+                limit: self.max_position_qty,
+            });
+        }
 
-        if total_notional > self.config.max_total_notional {
-            return Err(RiskError::NotionalLimitExceeded {
-                value: total_notional,
-                limit: self.config.max_total_notional,
+        let gross = gross_notional.saturating_add(qty_value.saturating_mul(mid));
+        if gross > self.max_gross_notional {
+            return Err(RiskViolation::GrossNotional {
+                gross,
+                limit: self.max_gross_notional,
             });
         }
 
         Ok(())
     }
 
-    /// Post-trade checks (e.g., after fills)
-    pub fn check_post_trade(&self, state: &EngineState) -> Result<(), RiskError> {
-        // Check total notional exposure across all positions
-        let total_notional: f64 = state
-            .positions
-            .values()
-            .map(|p| p.avg_price * p.quantity.abs() as f64)
-            .sum();
-
-        if total_notional > self.config.max_total_notional {
-            return Err(RiskError::NotionalLimitExceeded {
-                value: total_notional,
-                limit: self.config.max_total_notional,
-            });
-        }
-
-        // Check individual position limits
-        for position in state.positions.values() {
-            if position.quantity.unsigned_abs() > self.config.max_position {
-                return Err(RiskError::PositionLimitExceeded {
-                    current: position.quantity,
-                    limit: self.config.max_position as i64,
-                });
-            }
-
-            // Check for excessive realized losses (circuit breaker)
-            // Halt trading if losses exceed a threshold (e.g., 50% of max notional)
-            let max_loss_threshold = -0.5 * self.config.max_total_notional;
-            if position.realized_pnl < max_loss_threshold {
-                return Err(RiskError::InsufficientCapital);
-            }
-        }
-
-        Ok(())
+    /// Whether total P&L has reached the loss limit.
+    pub fn loss_limit_breached(&self, total_pnl: TickValue) -> bool {
+        total_pnl <= -self.max_loss
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::{ParentOrderStatus, Position};
-    use orderbook::{Quantity, Timestamp};
 
-    fn create_test_parent_order(
-        symbol: &str,
-        side: Side,
-        qty: u64,
-        price: Option<f64>,
-    ) -> ParentOrder {
-        ParentOrder {
-            id: 1,
-            symbol: symbol.to_string(),
-            side,
-            total_qty: Quantity::new(qty),
-            filled_qty: Quantity::ZERO,
-            limit_price: price.map(Price::from_f64),
-            start_time_ns: 0,
-            end_time_ns: 10_000,
-            algo_type: "TWAP".to_string(),
-            num_slices: 10,
-            status: ParentOrderStatus::Pending,
-            child_order_ids: vec![],
-            created_at: Timestamp::now_nanos(),
+    const MID: i64 = 10_000_000;
+
+    fn limits() -> RiskLimits {
+        RiskLimits {
+            max_order_qty: 1_000,
+            max_order_notional: 1_000 * TickValue::from(MID),
+            max_position_qty: 1_500,
+            max_gross_notional: 5_000 * TickValue::from(MID),
+            price_collar_bps: 100,
+            max_loss: 1_000_000,
         }
     }
 
-    #[test]
-    fn test_order_size_limit() {
-        let config = RiskConfig {
-            max_order_size: 1000,
-            ..Default::default()
-        };
-        let checker = RiskChecker::new(config);
-        let state = EngineState::new();
+    fn flat() -> SymbolExposure {
+        SymbolExposure {
+            position: 0,
+            working_buy_qty: 0,
+            working_sell_qty: 0,
+            mid: Price::new(MID),
+        }
+    }
 
-        // Order within limit
-        let order = create_test_parent_order("BTC", Side::Buy, 500, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_ok());
-
-        // Order exceeds limit
-        let order = create_test_parent_order("BTC", Side::Buy, 2000, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_err());
+    fn check(
+        side: Side,
+        qty: u64,
+        limit: Option<i64>,
+        exposure: SymbolExposure,
+    ) -> Result<(), RiskViolation> {
+        limits().check_new_order(side, qty, limit.map(Price::new), exposure, 0)
     }
 
     #[test]
-    fn test_notional_limit() {
-        let config = RiskConfig {
-            max_order_notional: 10_000.0,
-            ..Default::default()
-        };
-        let checker = RiskChecker::new(config);
-        let state = EngineState::new();
-
-        // Within limit: 50 * 100 = 5000
-        let order = create_test_parent_order("BTC", Side::Buy, 50, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_ok());
-
-        // Exceeds limit: 200 * 100 = 20000
-        let order = create_test_parent_order("BTC", Side::Buy, 200, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_err());
+    fn order_quantity_limit() {
+        assert!(check(Side::Buy, 1_000, None, flat()).is_ok());
+        assert!(matches!(
+            check(Side::Buy, 1_001, None, flat()),
+            Err(RiskViolation::OrderQuantity { .. })
+        ));
     }
 
     #[test]
-    fn test_position_limit() {
-        let config = RiskConfig {
-            max_position: 100,
-            ..Default::default()
-        };
-        let checker = RiskChecker::new(config);
-        let mut state = EngineState::new();
-
-        // Add existing position
-        state.positions.insert(
-            "BTC".to_string(),
-            Position {
-                symbol: "BTC".to_string(),
-                quantity: 80,
-                avg_price: 100.0,
-                realized_pnl: 0.0,
-                unrealized_pnl: 0.0,
-            },
-        );
-
-        // Buy 10 more: 80 + 10 = 90 (OK)
-        let order = create_test_parent_order("BTC", Side::Buy, 10, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_ok());
-
-        // Buy 30 more: 80 + 30 = 110 (exceeds limit)
-        let order = create_test_parent_order("BTC", Side::Buy, 30, Some(100.0));
-        assert!(checker.check_parent_order(&order, &state).is_err());
+    fn price_collar_is_inclusive_on_both_sides() {
+        // 100 bps of 10_000_000 ticks is 100_000 ticks.
+        assert!(check(Side::Sell, 10, Some(MID + 100_000), flat()).is_ok());
+        assert!(check(Side::Buy, 10, Some(MID - 100_000), flat()).is_ok());
+        assert!(matches!(
+            check(Side::Buy, 10, Some(MID + 100_001), flat()),
+            Err(RiskViolation::PriceCollar { .. })
+        ));
+        assert!(matches!(
+            check(Side::Sell, 10, Some(MID - 100_001), flat()),
+            Err(RiskViolation::PriceCollar { .. })
+        ));
     }
 
     #[test]
-    fn test_price_sanity() {
-        let config = RiskConfig {
-            min_price: Price::from_f64(1.0),
-            max_price: Price::from_f64(1000.0),
-            ..Default::default()
+    fn notional_uses_the_worse_of_limit_and_mid() {
+        assert!(check(Side::Buy, 1_000, None, flat()).is_ok());
+        // A limit above the mid is priced at the limit...
+        assert!(matches!(
+            check(Side::Buy, 1_000, Some(MID + 1), flat()),
+            Err(RiskViolation::OrderNotional { .. })
+        ));
+        // ...and a limit below the mid at the mid.
+        assert!(check(Side::Sell, 1_000, Some(MID - 1), flat()).is_ok());
+    }
+
+    #[test]
+    fn position_limit_counts_working_orders() {
+        let long = SymbolExposure {
+            position: 500,
+            working_buy_qty: 600,
+            ..flat()
         };
-        let checker = RiskChecker::new(config);
-        let state = EngineState::new();
+        assert!(check(Side::Buy, 400, None, long).is_ok());
+        assert!(matches!(
+            check(Side::Buy, 401, None, long),
+            Err(RiskViolation::PositionLimit {
+                worst_case: 1_501,
+                ..
+            })
+        ));
+        // Selling reduces the long, so it is allowed.
+        assert!(check(Side::Sell, 1_000, None, long).is_ok());
 
-        // Valid price
-        let order = create_test_parent_order("BTC", Side::Buy, 10, Some(500.0));
-        assert!(checker.check_parent_order(&order, &state).is_ok());
+        let short = SymbolExposure {
+            position: -500,
+            working_sell_qty: 600,
+            ..flat()
+        };
+        assert!(check(Side::Sell, 400, None, short).is_ok());
+        assert!(check(Side::Sell, 401, None, short).is_err());
+    }
 
-        // Price too low
-        let order = create_test_parent_order("BTC", Side::Buy, 10, Some(0.5));
-        assert!(checker.check_parent_order(&order, &state).is_err());
+    #[test]
+    fn gross_notional_includes_the_new_order() {
+        let before = 4_500 * TickValue::from(MID);
+        assert!(limits()
+            .check_new_order(Side::Buy, 500, None, flat(), before)
+            .is_ok());
+        assert!(matches!(
+            limits().check_new_order(Side::Buy, 501, None, flat(), before),
+            Err(RiskViolation::GrossNotional { .. })
+        ));
+    }
 
-        // Price too high
-        let order = create_test_parent_order("BTC", Side::Buy, 10, Some(5000.0));
-        assert!(checker.check_parent_order(&order, &state).is_err());
+    #[test]
+    fn loss_limit_is_inclusive() {
+        assert!(limits().loss_limit_breached(-1_000_000));
+        assert!(!limits().loss_limit_breached(-999_999));
     }
 }

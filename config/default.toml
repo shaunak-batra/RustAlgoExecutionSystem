@@ -1,155 +1,59 @@
-# QuantSystem Configuration File
-# This file contains all runtime configuration parameters for the trading system
+# Engine server settings, loaded by `cargo run -p engine -- --config config/default.toml`.
+#
+# Unknown keys are rejected, so a misspelled setting is an error rather than a
+# silent default. Money amounts are in price units; the engine converts them to
+# integer ticks (1 price unit = 100000 ticks).
 
 [engine]
-# Clock tick interval in milliseconds (how often the engine processes events)
-clock_tick_interval_ms = 100
-
-# Maximum number of pending orders in the system
-max_pending_orders = 10000
-
-# Enable smart order routing (Phase 2 feature)
-enable_smart_routing = false
-
-# Number of routing retry attempts before giving up
-routing_retry_attempts = 3
-
-
-[market_data]
-# Market data mode: "websocket" or "rest_api"
-# - websocket: Real-time WebSocket feed (low latency)
-# - rest_api: REST API polling (fallback mode)
-mode = "rest_api"
-
-# WebSocket stream URL for Binance
-websocket_url = "wss://stream.binance.com:9443/ws"
-
-# REST API base URL for Binance
-rest_api_url = "https://api.binance.com"
-
-# Automatically fallback to REST API if WebSocket fails
-fallback_on_ws_failure = true
-
-# Number of WebSocket reconnection attempts before falling back to REST
-ws_reconnect_attempts = 5
-
-# Tick sampling interval in milliseconds (how often to record market data)
-# 10000ms = 10 seconds (reduces storage from 500MB-1GB/day to ~50MB/day)
-tick_sample_interval_ms = 10000
-
-# REST API polling interval in milliseconds
-rest_poll_interval_ms = 2000
-
-# Symbols to subscribe to (lowercase for Binance)
-symbols = ["btcusdt", "ethusdt", "bnbusdt", "adausdt", "solusdt"]
-
-
-[risk]
-# Maximum position size per symbol (in quote currency, e.g., USDT)
-max_position_size = 100000.0
-
-# Maximum total exposure across all symbols
-max_total_exposure = 500000.0
-
-# Stop loss percentage (0.02 = 2%)
-stop_loss_pct = 0.02
-
-# Take profit percentage (0.05 = 5%)
-take_profit_pct = 0.05
-
-# Enable real-time risk checks before order submission
-enable_risk_checks = true
-
-# Maximum daily loss limit (in quote currency)
-max_daily_loss = 10000.0
-
-
-[database]
-# SQLite database file path (relative to project root)
-path = "trading_system.db"
-
-# Enable database persistence (save orders, trades, positions)
-enable_persistence = true
-
-# Enable tick data recording (market data snapshots)
-enable_tick_recording = true
-
-# Auto-vacuum database periodically to reclaim space
-auto_vacuum = true
-
+# How often due child orders are released and simulated quotes are refreshed.
+tick_interval_ms = 50
+# Capacity of the channel from the gRPC service to the engine task.
+command_buffer = 1024
+# How many fills a slow StreamFills client may fall behind before its stream ends with DATA_LOSS.
+fill_buffer = 4096
+# Finished parent orders kept for GetOrderStatus; older ones are forgotten.
+retained_finished_orders = 10000
 
 [api]
-# gRPC server host
-host = "127.0.0.1"
+# The API has no authentication, so it listens on loopback only.
+listen_addr = "127.0.0.1:50051"
 
-# gRPC server port
-port = 50051
+[risk]
+# Largest single parent order, in units.
+max_order_qty = 100000
+# Largest single parent order notional, priced at the worse of its limit price and the mid.
+max_order_notional = 10000000.0
+# Largest absolute position per symbol, counting unfilled working orders as if they filled.
+max_position_qty = 500000
+# Largest gross exposure across all symbols, including working orders.
+max_gross_notional = 50000000.0
+# Limit prices must be within this many basis points of the mid.
+price_collar_bps = 500
+# Trading halts (working orders cancelled, new orders rejected) once total P&L falls to -max_loss.
+max_loss = 250000.0
 
-# Enable server reflection (allows grpcurl and other tools to introspect)
-enable_reflection = true
+# Simulated markets. A market maker quotes `levels` price levels on each side of
+# `reference_price`, `level_spacing_bps` apart, with `qty_per_level` units at each,
+# and replaces its quotes every tick. The reference price does not move: trading
+# consumes depth, which the next refresh restores.
 
-# Maximum concurrent gRPC streams
-max_concurrent_streams = 100
+[[venue.symbols]]
+symbol = "BTC-USD"
+reference_price = 65000.0
+levels = 20
+qty_per_level = 5
+level_spacing_bps = 1
 
+[[venue.symbols]]
+symbol = "ETH-USD"
+reference_price = 3500.0
+levels = 20
+qty_per_level = 50
+level_spacing_bps = 1
 
-[gui]
-# Window title
-window_title = "Algorithmic Trading System - QuantSystem"
-
-# Initial window dimensions
-window_width = 1400
-window_height = 900
-
-# Theme: "light" or "dark"
-theme = "dark"
-
-# Chart update interval in milliseconds
-chart_update_interval_ms = 500
-
-# News feed update interval in milliseconds
-news_update_interval_ms = 5000
-
-# Enable keyboard shortcuts (Phase 6 feature)
-enable_keyboard_shortcuts = true
-
-
-[algorithms.twap]
-# Default slice duration in seconds for TWAP algorithm
-# (total order divided into slices of this duration)
-default_slice_duration_secs = 60
-
-# Enable adaptive TWAP (adjust slicing based on volatility)
-enable_adaptive = false
-
-# Volatility calculation window (number of ticks)
-adaptive_volatility_window = 20
-
-
-[algorithms.pov]
-# Default participation rate (0.0 to 1.0)
-# 0.1 = target 10% of market volume
-default_participation_rate = 0.1
-
-# Minimum participation rate
-min_participation_rate = 0.01
-
-# Maximum participation rate
-max_participation_rate = 0.5
-
-
-[algorithms.vwap]
-# Volume profile calculation window in seconds
-# 3600 = 1 hour historical volume profile
-volume_profile_window_secs = 3600
-
-# Enable intraday volume curve modeling
-enable_intraday_curve = true
-
-
-[algorithms.is_algo]
-# Risk aversion parameter (lambda in Almgren-Chriss model)
-# Higher values = more conservative execution
-risk_aversion = 1.0
-
-# Market impact model: "almgren_chriss" or "linear"
-impact_model = "almgren_chriss"
+[[venue.symbols]]
+symbol = "SIM-EQ"
+reference_price = 100.0
+levels = 10
+qty_per_level = 5000
+level_spacing_bps = 2

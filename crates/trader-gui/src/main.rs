@@ -1,6 +1,6 @@
 use analytics::{EquityPoint, PerformanceAnalyzer, PerformanceMetrics, Trade, TradeType};
 use api::proto::execution_service_client::ExecutionServiceClient;
-use api::proto::{ParentOrderRequest, PositionsRequest};
+use api::proto::PositionsRequest;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use orderbook::Side;
@@ -308,7 +308,8 @@ impl Default for TraderApp {
     fn default() -> Self {
         let app = Self {
             current_page: Page::Dashboard,
-            server_address: "127.0.0.1:9090".to_string(),
+            // Matches [api].listen_addr in config/default.toml.
+            server_address: "127.0.0.1:50051".to_string(),
             symbol: "BTCUSDT".to_string(),
             side: Side::Buy,
             quantity: "1000".to_string(),
@@ -2160,15 +2161,22 @@ impl TraderApp {
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_nanos() as u64;
-                        let request = ParentOrderRequest {
+                        let request = api::proto::SubmitParentOrderRequest {
                             symbol: symbol.clone(),
-                            side: side_str.clone(),
+                            side: if side_str == "BUY" {
+                                api::proto::Side::Buy as i32
+                            } else {
+                                api::proto::Side::Sell as i32
+                            },
                             quantity: slice_qty,
-                            limit_price_ticks: 0, // Market order
+                            limit_price_ticks: None, // market child orders
                             start_time_ns: now,
                             end_time_ns: now + (base_slice_secs * 1_000_000_000),
-                            algo_type: "TWAP".to_string(),
-                            num_slices: 1,
+                            algorithm: Some(
+                                api::proto::submit_parent_order_request::Algorithm::Twap(
+                                    api::proto::TwapParams { num_slices: 1 },
+                                ),
+                            ),
                         };
                         client.submit_parent_order(request).await
                     });
@@ -2176,13 +2184,18 @@ impl TraderApp {
                     match result {
                         Ok(response) => {
                             let resp = response.into_inner();
-                            eprintln!("  ✅ Order #{} ACCEPTED", resp.parent_order_id);
+                            let status = if resp.accepted {
+                                "WORKING".to_string()
+                            } else {
+                                format!("REJECTED: {}", resp.reject_reason)
+                            };
+                            eprintln!("  Order #{} {}", resp.parent_order_id, status);
 
                             log_message(
                                 &state,
                                 "ADAPTIVE TWAP",
                                 &format!(
-                                    "📋 Slice {}/{} submitted: Order #{} for {} qty",
+                                    "Slice {}/{} submitted: Order #{} for {} qty",
                                     slice_num + 1,
                                     num_slices,
                                     resp.parent_order_id,
@@ -2196,7 +2209,7 @@ impl TraderApp {
                                 side: side_str,
                                 quantity: slice_qty,
                                 filled_qty: 0,
-                                status: resp.status.clone(),
+                                status: status.clone(),
                                 submitted_at: chrono::Local::now().format("%H:%M:%S").to_string(),
                             };
 
@@ -2387,31 +2400,38 @@ impl TraderApp {
 
                 if let Ok(response) = result {
                     let resp = response.into_inner();
+                    let state_name = match api::proto::ParentOrderState::try_from(resp.state) {
+                        Ok(api::proto::ParentOrderState::Working) => "WORKING",
+                        Ok(api::proto::ParentOrderState::Filled) => "FILLED",
+                        Ok(api::proto::ParentOrderState::Cancelled) => "CANCELLED",
+                        Ok(api::proto::ParentOrderState::Expired) => "EXPIRED",
+                        _ => "UNKNOWN",
+                    }
+                    .to_string();
                     let mut orders = state.orders.lock().unwrap();
 
                     if let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) {
                         let old_status = order.status.clone();
                         let old_filled = order.filled_qty;
 
-                        order.status = resp.status.clone();
-                        order.filled_qty = resp.filled_qty;
+                        order.status = state_name.clone();
+                        order.filled_qty = resp.filled_quantity;
 
-                        if old_status != resp.status || old_filled != resp.filled_qty {
-                            eprintln!("\n[ORDER UPDATE] Order #{} Status Change", order_id);
-                            eprintln!("  Status: {} -> {}", old_status, resp.status);
+                        if old_status != state_name || old_filled != resp.filled_quantity {
+                            eprintln!("\n[ORDER UPDATE] Order #{} state change", order_id);
+                            eprintln!("  State: {} -> {}", old_status, state_name);
                             eprintln!(
                                 "  Filled: {} -> {}/{}",
-                                old_filled, resp.filled_qty, order.quantity
+                                old_filled, resp.filled_quantity, order.quantity
                             );
 
-                            if resp.status == "FILLED" {
-                                eprintln!("  ✅ ORDER FULLY FILLED!");
+                            if state_name == "FILLED" {
                                 log_message(
                                     &state,
                                     "ORDER UPDATE",
                                     &format!(
-                                        "✅ Order #{} FILLED: {}/{}",
-                                        order_id, resp.filled_qty, order.quantity
+                                        "Order #{} FILLED: {}/{}",
+                                        order_id, resp.filled_quantity, order.quantity
                                     ),
                                 );
                             } else {
@@ -2419,14 +2439,14 @@ impl TraderApp {
                                     &state,
                                     "ORDER UPDATE",
                                     &format!(
-                                        "Order #{} status: {} ({}/{})",
-                                        order_id, resp.status, resp.filled_qty, order.quantity
+                                        "Order #{} state: {} ({}/{})",
+                                        order_id, state_name, resp.filled_quantity, order.quantity
                                     ),
                                 );
                             }
                         }
 
-                        if resp.status == "FILLED" && resp.filled_qty > 0 {
+                        if state_name == "FILLED" && resp.filled_quantity > 0 {
                             eprintln!("[PERFORMANCE] Updating performance metrics from fills...");
                             drop(orders);
                             update_performance_from_fills(&state);
@@ -2518,19 +2538,21 @@ impl TraderApp {
                     .as_nanos() as u64;
                 let duration_ns = (duration * 1_000_000_000.0) as u64;
 
-                let request = ParentOrderRequest {
+                let request = api::proto::SubmitParentOrderRequest {
                     symbol: symbol.clone(),
-                    side: side_str.clone(),
-                    quantity: qty,
-                    limit_price_ticks: if limit_price > 0.0 {
-                        (limit_price * 100.0) as i64
+                    side: if side_str == "BUY" {
+                        api::proto::Side::Buy as i32
                     } else {
-                        0
+                        api::proto::Side::Sell as i32
                     },
+                    quantity: qty,
+                    limit_price_ticks: (limit_price > 0.0)
+                        .then(|| orderbook::Price::from_f64(limit_price).ticks()),
                     start_time_ns: now,
                     end_time_ns: now + duration_ns,
-                    algo_type: algo_type.clone(),
-                    num_slices,
+                    algorithm: Some(api::proto::submit_parent_order_request::Algorithm::Twap(
+                        api::proto::TwapParams { num_slices },
+                    )),
                 };
 
                 client.submit_parent_order(request).await
@@ -2539,9 +2561,14 @@ impl TraderApp {
             match result {
                 Ok(response) => {
                     let resp = response.into_inner();
-                    eprintln!("\n[TRADING] ✅ Order Accepted by Engine!");
+                    let status = if resp.accepted {
+                        "WORKING".to_string()
+                    } else {
+                        format!("REJECTED: {}", resp.reject_reason)
+                    };
+                    eprintln!("\n[TRADING] Order response from engine");
                     eprintln!("  Order ID: {}", resp.parent_order_id);
-                    eprintln!("  Status: {}", resp.status);
+                    eprintln!("  Status: {}", status);
                     eprintln!("  Symbol: {}", symbol);
                     eprintln!("  Side: {}", side_str);
                     eprintln!("  Qty: {}", qty);
@@ -2562,13 +2589,13 @@ impl TraderApp {
                         side: side_str,
                         quantity: qty,
                         filled_qty: 0,
-                        status: resp.status.clone(),
+                        status: status.clone(),
                         submitted_at: chrono::Local::now().format("%H:%M:%S").to_string(),
                     };
 
                     state.orders.lock().unwrap().insert(0, order);
                     *state.status_message.lock().unwrap() =
-                        format!("Order {} {}", resp.parent_order_id, resp.status);
+                        format!("Order {} {}", resp.parent_order_id, status);
                 }
                 Err(e) => {
                     eprintln!("\n[TRADING] ❌ Order Submission FAILED!");
@@ -2613,16 +2640,17 @@ impl TraderApp {
             match positions_result {
                 Ok(response) => {
                     let resp = response.into_inner();
-
-                    if resp.position != 0 {
-                        let mut positions = state.positions.lock().unwrap();
-                        positions.clear();
+                    // The engine reports money in price ticks x units.
+                    let scale = orderbook::Price::TICK_SCALE;
+                    let mut positions = state.positions.lock().unwrap();
+                    positions.clear();
+                    for position in resp.positions {
                         positions.push(PositionInfo {
-                            symbol: resp.symbol,
-                            quantity: resp.position,
-                            avg_price: 0.0,
-                            realized_pnl: resp.realized_pnl,
-                            unrealized_pnl: resp.unrealized_pnl,
+                            symbol: position.symbol,
+                            quantity: position.quantity,
+                            avg_price: position.average_price_ticks.unwrap_or(0.0) / scale,
+                            realized_pnl: position.realized_pnl as f64 / scale,
+                            unrealized_pnl: position.unrealized_pnl.unwrap_or(0) as f64 / scale,
                         });
                     }
                 }

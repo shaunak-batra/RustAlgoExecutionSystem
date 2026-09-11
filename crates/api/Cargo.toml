@@ -7,17 +7,10 @@ edition = "2021"
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-rand = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 orderbook = { path = "../orderbook" }
-algo-core = { path = "../algo-core" }
 
 [build-dependencies]
 tonic-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

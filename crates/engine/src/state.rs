@@ -1,261 +1,262 @@
-use api::{ParentOrder, Position};
-use orderbook::{Fill, Order, OrderId, Quantity, Side};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+//! Parent order lifecycle.
 
-/// Status of a child order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChildOrderInfo {
-    pub id: OrderId,
-    pub parent_id: u64,
-    pub status: String,
-    pub filled_qty: Quantity,
-    pub target_time_ns: u64,
+use algo_core::ChildOrderInstruction;
+use api::{ChildOrderView, NewParentOrder, ParentOrderState, ParentOrderView};
+use orderbook::{Price, Side};
+
+/// A parent order being worked by the engine.
+///
+/// The schedule decides how much should have been released by each time. Each
+/// time at least one slice becomes due, the engine sends one IOC child order
+/// for everything released but not yet filled, so quantity an earlier child
+/// could not fill is carried into the next one.
+#[derive(Debug, Clone)]
+pub struct ParentOrder {
+    pub id: u64,
+    pub symbol: String,
+    pub side: Side,
+    pub algorithm: &'static str,
+    pub quantity: u64,
+    pub limit_price: Option<Price>,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    /// Mid price when the order was accepted.
+    pub arrival_mid: Price,
+    state: ParentOrderState,
+    state_reason: Option<String>,
+    schedule: Vec<ChildOrderInstruction>,
+    next_slice: usize,
+    released_qty: u64,
+    filled_qty: u64,
+    /// Sum of fill price × quantity, in ticks × units.
+    fill_notional: i128,
+    children: Vec<ChildOrderView>,
 }
 
-/// Execution engine state.
-#[derive(Debug)]
-pub struct EngineState {
-    /// Parent orders by ID
-    pub parent_orders: HashMap<u64, ParentOrder>,
-
-    /// Child order tracking
-    pub child_orders: HashMap<OrderId, ChildOrderInfo>,
-
-    /// Position tracking by symbol
-    pub positions: HashMap<String, Position>,
-
-    /// All fills
-    pub fills: Vec<Fill>,
-
-    /// Pending child orders (target_time_ns, order)
-    pub pending_children: Vec<(u64, Order)>,
-
-    /// Next parent order ID
-    next_parent_id: u64,
-
-    /// Next child order ID
-    next_child_id: u64,
-}
-
-impl EngineState {
-    pub fn new() -> Self {
+impl ParentOrder {
+    pub fn new(
+        id: u64,
+        order: &NewParentOrder,
+        schedule: Vec<ChildOrderInstruction>,
+        arrival_mid: Price,
+    ) -> Self {
         Self {
-            parent_orders: HashMap::new(),
-            child_orders: HashMap::new(),
-            positions: HashMap::new(),
-            fills: Vec::new(),
-            pending_children: Vec::new(),
-            next_parent_id: 1,
-            next_child_id: 1000,
+            id,
+            symbol: order.symbol.clone(),
+            side: order.side,
+            algorithm: order.algorithm.name(),
+            quantity: order.quantity,
+            limit_price: order.limit_price,
+            start_ns: order.start_ns,
+            end_ns: order.end_ns,
+            arrival_mid,
+            state: ParentOrderState::Working,
+            state_reason: None,
+            schedule,
+            next_slice: 0,
+            released_qty: 0,
+            filled_qty: 0,
+            fill_notional: 0,
+            children: Vec::new(),
         }
     }
 
-    pub fn next_parent_id(&mut self) -> u64 {
-        let id = self.next_parent_id;
-        self.next_parent_id += 1;
-        id
+    pub fn state(&self) -> ParentOrderState {
+        self.state
     }
 
-    pub fn next_child_id(&mut self) -> OrderId {
-        let id = OrderId::new(self.next_child_id);
-        self.next_child_id += 1;
-        id
+    pub fn is_working(&self) -> bool {
+        self.state == ParentOrderState::Working
     }
 
-    pub fn add_parent_order(&mut self, order: ParentOrder) {
-        self.parent_orders.insert(order.id, order);
+    pub fn filled_qty(&self) -> u64 {
+        self.filled_qty
     }
 
-    pub fn get_parent_order(&self, id: u64) -> Option<&ParentOrder> {
-        self.parent_orders.get(&id)
+    /// Quantity not yet filled.
+    pub fn unfilled_qty(&self) -> u64 {
+        self.quantity - self.filled_qty
     }
 
-    pub fn get_parent_order_mut(&mut self, id: u64) -> Option<&mut ParentOrder> {
-        self.parent_orders.get_mut(&id)
-    }
-
-    pub fn add_child_order(&mut self, info: ChildOrderInfo) {
-        self.child_orders.insert(info.id, info);
-    }
-
-    pub fn get_child_order(&self, id: &OrderId) -> Option<&ChildOrderInfo> {
-        self.child_orders.get(id)
-    }
-
-    pub fn get_child_order_mut(&mut self, id: &OrderId) -> Option<&mut ChildOrderInfo> {
-        self.child_orders.get_mut(id)
-    }
-
-    /// Update position based on a fill.
-    pub fn update_position(&mut self, symbol: &str, fill: &Fill, side: Side) {
-        let position = self
-            .positions
-            .entry(symbol.to_string())
-            .or_insert_with(|| Position {
-                symbol: symbol.to_string(),
-                quantity: 0,
-                avg_price: 0.0,
-                realized_pnl: 0.0,
-                unrealized_pnl: 0.0,
-            });
-
-        let fill_qty = fill.qty.value() as i64;
-        let fill_price = fill.price.as_f64();
-
-        match side {
-            Side::Buy => {
-                // Update average price
-                if position.quantity >= 0 {
-                    // Increasing long position
-                    let total_cost = position.avg_price * position.quantity as f64
-                        + fill_price * fill_qty as f64;
-
-                    // Use checked arithmetic to prevent overflow
-                    let new_qty = position
-                        .quantity
-                        .checked_add(fill_qty)
-                        .expect("Position quantity overflow on buy - quantity too large");
-
-                    position.quantity = new_qty;
-                    position.avg_price = total_cost / position.quantity as f64;
-                } else {
-                    // Reducing short position
-                    let pnl = (position.avg_price - fill_price) * fill_qty as f64;
-                    position.realized_pnl += pnl;
-
-                    let new_qty = position
-                        .quantity
-                        .checked_add(fill_qty)
-                        .expect("Position quantity overflow while reducing short");
-
-                    position.quantity = new_qty;
-                    if position.quantity == 0 {
-                        position.avg_price = 0.0;
-                    }
-                }
+    /// Releases every scheduled slice due by `now_ns`. If at least one slice
+    /// became due, returns the quantity to send now: everything released but
+    /// not yet filled. Otherwise returns 0.
+    pub fn release_due(&mut self, now_ns: u64) -> u64 {
+        let mut released_any = false;
+        while let Some(slice) = self.schedule.get(self.next_slice) {
+            if slice.target_time_ns > now_ns {
+                break;
             }
-            Side::Sell => {
-                if position.quantity <= 0 {
-                    // Increasing short position
-                    let total_cost = position.avg_price * (-position.quantity) as f64
-                        + fill_price * fill_qty as f64;
-
-                    let new_qty = position
-                        .quantity
-                        .checked_sub(fill_qty)
-                        .expect("Position quantity underflow on sell - quantity too large");
-
-                    position.quantity = new_qty;
-                    position.avg_price = total_cost / (-position.quantity) as f64;
-                } else {
-                    // Reducing long position
-                    let pnl = (fill_price - position.avg_price) * fill_qty as f64;
-                    position.realized_pnl += pnl;
-
-                    let new_qty = position
-                        .quantity
-                        .checked_sub(fill_qty)
-                        .expect("Position quantity underflow while reducing long");
-
-                    position.quantity = new_qty;
-                    if position.quantity == 0 {
-                        position.avg_price = 0.0;
-                    }
-                }
-            }
+            self.released_qty += slice.qty;
+            self.next_slice += 1;
+            released_any = true;
+        }
+        if released_any {
+            self.released_qty - self.filled_qty
+        } else {
+            0
         }
     }
 
-    pub fn get_position(&self, symbol: &str) -> Option<&Position> {
-        self.positions.get(symbol)
+    /// Records a child order that is about to be sent.
+    pub fn record_child(&mut self, child_order_id: u64, sent_at_ns: u64, quantity: u64) {
+        self.children.push(ChildOrderView {
+            child_order_id,
+            sent_at_ns,
+            quantity,
+            filled_quantity: 0,
+        });
     }
 
-    /// Get position with calculated unrealized PnL based on current market price
-    pub fn get_position_with_pnl(&self, symbol: &str, current_price: f64) -> Option<Position> {
-        self.positions.get(symbol).map(|pos| {
-            let mut position = pos.clone();
-            // Calculate unrealized PnL
-            // For long positions: (current_price - avg_price) * quantity
-            // For short positions: (avg_price - current_price) * abs(quantity)
-            position.unrealized_pnl =
-                (current_price - position.avg_price) * position.quantity as f64;
-            position
-        })
+    /// Records a fill of the most recent child order.
+    pub fn record_fill(&mut self, price: Price, qty: u64) {
+        self.filled_qty += qty;
+        self.fill_notional += i128::from(price.ticks()) * i128::from(qty);
+        if let Some(child) = self.children.last_mut() {
+            child.filled_quantity += qty;
+        }
     }
 
-    pub fn add_fill(&mut self, fill: Fill) {
-        self.fills.push(fill);
+    /// Marks the order filled once its full quantity has executed.
+    pub fn finish_if_filled(&mut self) {
+        if self.filled_qty == self.quantity {
+            self.state = ParentOrderState::Filled;
+        }
     }
 
-    /// Get child orders for a parent
-    pub fn get_children_for_parent(&self, parent_id: u64) -> Vec<&ChildOrderInfo> {
-        self.child_orders
-            .values()
-            .filter(|c| c.parent_id == parent_id)
-            .collect()
+    /// Ends the order when its window is over: filled, or expired with the
+    /// unfilled quantity in the reason.
+    pub fn finish_window(&mut self) {
+        if self.filled_qty == self.quantity {
+            self.state = ParentOrderState::Filled;
+        } else {
+            self.state = ParentOrderState::Expired;
+            self.state_reason = Some(format!(
+                "window ended with {} of {} unfilled",
+                self.unfilled_qty(),
+                self.quantity
+            ));
+        }
     }
-}
 
-impl Default for EngineState {
-    fn default() -> Self {
-        Self::new()
+    pub fn cancel(&mut self, reason: impl Into<String>) {
+        self.state = ParentOrderState::Cancelled;
+        self.state_reason = Some(reason.into());
+    }
+
+    pub fn view(&self) -> ParentOrderView {
+        let average_fill_price_ticks =
+            (self.filled_qty > 0).then(|| self.fill_notional as f64 / self.filled_qty as f64);
+        let shortfall_bps = average_fill_price_ticks.map(|average| {
+            let arrival = self.arrival_mid.ticks() as f64;
+            let direction = match self.side {
+                Side::Buy => 1.0,
+                Side::Sell => -1.0,
+            };
+            direction * (average - arrival) / arrival * 10_000.0
+        });
+        ParentOrderView {
+            id: self.id,
+            symbol: self.symbol.clone(),
+            side: self.side,
+            algorithm: self.algorithm,
+            state: self.state,
+            state_reason: self.state_reason.clone(),
+            quantity: self.quantity,
+            filled_quantity: self.filled_qty,
+            limit_price: self.limit_price,
+            start_ns: self.start_ns,
+            end_ns: self.end_ns,
+            arrival_mid: self.arrival_mid,
+            average_fill_price_ticks,
+            shortfall_bps,
+            pending_slices: self.schedule.len() - self.next_slice,
+            children: self.children.clone(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orderbook::{Price, Timestamp};
+    use api::AlgorithmSpec;
 
-    fn fill(taker: u64, side: Side, price: f64, qty: u64) -> Fill {
-        Fill {
-            taker_order_id: OrderId::new(taker),
-            maker_order_id: OrderId::new(0),
-            taker_side: side,
-            price: Price::from_f64(price),
-            qty: Quantity::new(qty),
-            timestamp: Timestamp::new(0),
-        }
+    const SECOND: u64 = 1_000_000_000;
+    const MID: i64 = 10_000_000;
+
+    fn parent(side: Side) -> ParentOrder {
+        let order = NewParentOrder {
+            symbol: "SIM".to_string(),
+            side,
+            quantity: 300,
+            limit_price: None,
+            start_ns: 0,
+            end_ns: 3 * SECOND,
+            algorithm: AlgorithmSpec::Twap { num_slices: 3 },
+        };
+        let schedule = (0..3)
+            .map(|k| ChildOrderInstruction {
+                target_time_ns: k * SECOND,
+                qty: 100,
+            })
+            .collect();
+        ParentOrder::new(7, &order, schedule, Price::new(MID))
     }
 
     #[test]
-    fn test_position_long_build() {
-        let mut state = EngineState::new();
+    fn due_slices_are_merged_and_shortfalls_carried_forward() {
+        let mut order = parent(Side::Buy);
+        assert_eq!(order.release_due(0), 100);
+        order.record_child(1, 0, 100);
+        order.record_fill(Price::new(MID), 60);
 
-        state.update_position("BTC", &fill(1, Side::Buy, 100.0, 10), Side::Buy);
-        let pos = state.get_position("BTC").unwrap();
-        assert_eq!(pos.quantity, 10);
-        assert!((pos.avg_price - 100.0).abs() < 0.01);
-
-        // Add more at different price
-        state.update_position("BTC", &fill(2, Side::Buy, 105.0, 10), Side::Buy);
-        let pos = state.get_position("BTC").unwrap();
-        assert_eq!(pos.quantity, 20);
-        assert!((pos.avg_price - 102.5).abs() < 0.01); // (100*10 + 105*10) / 20
+        assert_eq!(order.release_due(SECOND / 2), 0, "no new slice is due yet");
+        // Two slices come due at once, plus the 40 the first child missed.
+        assert_eq!(order.release_due(2 * SECOND), 240);
+        assert_eq!(order.view().pending_slices, 0);
     }
 
     #[test]
-    fn test_position_round_trip() {
-        let mut state = EngineState::new();
+    fn window_end_fills_or_expires() {
+        let mut expired = parent(Side::Buy);
+        expired.release_due(2 * SECOND);
+        expired.record_child(1, 2 * SECOND, 300);
+        expired.record_fill(Price::new(MID), 180);
+        expired.finish_if_filled();
+        assert!(expired.is_working());
+        expired.finish_window();
+        assert_eq!(expired.state(), ParentOrderState::Expired);
+        assert_eq!(
+            expired.view().state_reason.as_deref(),
+            Some("window ended with 120 of 300 unfilled")
+        );
 
-        // Buy 10 at 100
-        state.update_position("BTC", &fill(1, Side::Buy, 100.0, 10), Side::Buy);
-
-        // Sell 10 at 110
-        state.update_position("BTC", &fill(2, Side::Sell, 110.0, 10), Side::Sell);
-
-        let pos = state.get_position("BTC").unwrap();
-        assert_eq!(pos.quantity, 0);
-        assert!((pos.realized_pnl - 100.0).abs() < 0.01); // 10 * (110 - 100)
+        let mut filled = parent(Side::Buy);
+        filled.release_due(2 * SECOND);
+        filled.record_child(1, 2 * SECOND, 300);
+        filled.record_fill(Price::new(MID), 300);
+        filled.finish_if_filled();
+        assert_eq!(filled.state(), ParentOrderState::Filled);
     }
 
     #[test]
-    fn test_next_id_generation() {
-        let mut state = EngineState::new();
-        assert_eq!(state.next_parent_id(), 1);
-        assert_eq!(state.next_parent_id(), 2);
-        assert_eq!(state.next_child_id(), OrderId::new(1000));
-        assert_eq!(state.next_child_id(), OrderId::new(1001));
+    fn view_reports_average_price_and_signed_shortfall() {
+        let mut buy = parent(Side::Buy);
+        buy.release_due(0);
+        buy.record_child(1, 0, 100);
+        buy.record_fill(Price::new(MID + 1_000), 50);
+        buy.record_fill(Price::new(MID + 3_000), 50);
+        let view = buy.view();
+        assert_eq!(view.average_fill_price_ticks, Some((MID + 2_000) as f64));
+        assert!((view.shortfall_bps.unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(view.children[0].filled_quantity, 100);
+
+        let mut sell = parent(Side::Sell);
+        sell.release_due(0);
+        sell.record_child(1, 0, 100);
+        sell.record_fill(Price::new(MID - 1_000), 100);
+        assert!((sell.view().shortfall_bps.unwrap() - 1.0).abs() < 1e-9);
+
+        assert_eq!(parent(Side::Buy).view().shortfall_bps, None);
     }
 }

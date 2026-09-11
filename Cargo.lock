@@ -256,13 +256,9 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 name = "api"
 version = "0.1.0"
 dependencies = [
- "algo-core",
  "orderbook",
  "prost",
  "protoc-bin-vendored",
- "rand 0.8.5",
- "serde",
- "thiserror 2.0.17",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -972,8 +968,8 @@ dependencies = [
 name = "config"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "serde",
+ "thiserror 2.0.17",
  "toml",
 ]
 
@@ -1354,12 +1350,13 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "algo-core",
- "anyhow",
  "api",
+ "config",
  "orderbook",
- "serde",
+ "proptest",
  "thiserror 2.0.17",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

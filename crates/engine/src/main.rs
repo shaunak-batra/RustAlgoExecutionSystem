@@ -1,47 +1,59 @@
-use api::start_grpc_server;
-use engine::{EngineCommand, ExecutionEngine};
+//! Engine server: loads settings, then runs the engine task and the gRPC API
+//! until Ctrl+C.
+//!
+//! Usage: `engine [--config <path>]` (default: `config/default.toml`).
+
+use engine::{EngineConfig, EngineCore, ExecutionEngine};
+use std::process::ExitCode;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, Level};
+use tracing::{error, info};
+
+const DEFAULT_CONFIG: &str = "config/default.toml";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_target(false)
-        .init();
-
-    info!("Starting Algo Execution Engine...");
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(1000);
-
-    let engine = ExecutionEngine::new("BTC-USD".to_string(), 100);
-
-    let engine_handle = tokio::spawn(async move {
-        engine.run(cmd_rx).await;
-    });
-
-    let grpc_addr = "0.0.0.0:9090";
-    info!("Starting gRPC server on {}...", grpc_addr);
-
-    let cmd_tx_clone = cmd_tx.clone();
-    let grpc_handle = tokio::spawn(async move {
-        if let Err(e) = start_grpc_server(cmd_tx_clone, grpc_addr).await {
-            eprintln!("gRPC server error: {}", e);
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt().with_target(false).init();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            error!("{message}");
+            ExitCode::FAILURE
         }
-    });
+    }
+}
 
-    info!("Engine and gRPC server running. Press Ctrl+C to stop...");
+async fn run() -> Result<(), String> {
+    let config_path = config_path(std::env::args().skip(1))?;
+    let settings = config::Settings::load(&config_path).map_err(|e| e.to_string())?;
+    let engine_config = EngineConfig::from_settings(&settings)
+        .map_err(|e| format!("invalid settings in {config_path}: {e}"))?;
+    let core = EngineCore::new(engine_config).map_err(|e| e.to_string())?;
 
-    tokio::signal::ctrl_c().await?;
+    let (commands, receiver) = mpsc::channel(settings.engine.command_buffer);
+    let engine = ExecutionEngine::new(
+        core,
+        Duration::from_millis(settings.engine.tick_interval_ms),
+        settings.engine.fill_buffer,
+    );
+    let engine_task = tokio::spawn(engine.run(receiver));
 
-    info!("Shutdown signal received, stopping engine...");
+    info!("serving the execution API on {}", settings.api.listen_addr);
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutting down");
+    };
+    let served = api::serve(commands.clone(), settings.api.listen_addr, shutdown).await;
 
-    cmd_tx.send(EngineCommand::Shutdown).await?;
+    let _ = commands.send(api::EngineCommand::Shutdown).await;
+    let _ = engine_task.await;
+    served.map_err(|e| format!("the gRPC server failed: {e}"))
+}
 
-    engine_handle.await?;
-    grpc_handle.abort();
-
-    info!("Engine stopped successfully");
-
-    Ok(())
+fn config_path(mut args: impl Iterator<Item = String>) -> Result<String, String> {
+    match (args.next(), args.next(), args.next()) {
+        (None, _, _) => Ok(DEFAULT_CONFIG.to_string()),
+        (Some(flag), Some(path), None) if flag == "--config" => Ok(path),
+        _ => Err("usage: engine [--config <path>]".to_string()),
+    }
 }

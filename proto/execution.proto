@@ -2,64 +2,157 @@ syntax = "proto3";
 
 package execution;
 
+// Execution engine API.
+//
+// Units: prices are integer ticks (100000 ticks = 1 price unit), quantities are
+// integer units, timestamps are Unix epoch nanoseconds, and P&L is in
+// ticks x units (divide by 100000 for price units x units). P&L values outside
+// the int64 range saturate.
 service ExecutionService {
-  rpc SubmitParentOrder(ParentOrderRequest) returns (ParentOrderResponse);
+  // Validates, risk-checks and schedules a parent order. Business rejections
+  // (unknown symbol, invalid schedule, risk limit, halted trading) return
+  // accepted = false with a reason; malformed requests fail with
+  // INVALID_ARGUMENT.
+  rpc SubmitParentOrder(SubmitParentOrderRequest) returns (SubmitParentOrderResponse);
+
+  // Stops a working parent order from releasing further child orders.
+  rpc CancelParentOrder(CancelParentOrderRequest) returns (CancelParentOrderResponse);
+
+  // State, fills and child orders of a parent order. NOT_FOUND if the id is
+  // unknown or the finished order is no longer retained.
   rpc GetOrderStatus(OrderStatusRequest) returns (OrderStatusResponse);
-  rpc StreamFills(StreamFillsRequest) returns (stream FillEvent);
+
+  // Positions and P&L, and whether the loss kill switch has halted trading.
   rpc GetPositions(PositionsRequest) returns (PositionsResponse);
+
+  // Fills of the engine's child orders from the moment of subscription. If the
+  // client falls too far behind, the stream ends with DATA_LOSS; resubscribe
+  // and reconcile with GetOrderStatus.
+  rpc StreamFills(StreamFillsRequest) returns (stream FillEvent);
 }
 
-message ParentOrderRequest {
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  SIDE_BUY = 1;
+  SIDE_SELL = 2;
+}
+
+// Equal quantity per time slice.
+message TwapParams {
+  uint32 num_slices = 1;
+}
+
+// Quantity proportional to a volume profile: one non-negative weight per slice.
+message VwapParams {
+  repeated double volume_profile = 1;
+}
+
+// Almgren-Chriss implementation shortfall, with time in seconds.
+message ImplementationShortfallParams {
+  uint32 num_slices = 1;
+  double risk_aversion = 2;     // lambda >= 0
+  double volatility = 3;        // sigma >= 0, price units per sqrt(second)
+  double temporary_impact = 4;  // eta > 0, price units per (unit/second)
+  double permanent_impact = 5;  // gamma >= 0, price units per unit
+}
+
+message SubmitParentOrderRequest {
   string symbol = 1;
-  string side = 2;  // "BUY" or "SELL"
+  Side side = 2;
   uint64 quantity = 3;
-  int64 limit_price_ticks = 4;  // Optional; 0 = market
+  // Worst acceptable execution price in ticks. Unset: child orders are market orders.
+  optional int64 limit_price_ticks = 4;
+  // Execution window [start_time_ns, end_time_ns).
   uint64 start_time_ns = 5;
   uint64 end_time_ns = 6;
-  string algo_type = 7;  // "TWAP", "POV", etc.
-  uint32 num_slices = 8;
+  oneof algorithm {
+    TwapParams twap = 10;
+    VwapParams vwap = 11;
+    ImplementationShortfallParams implementation_shortfall = 12;
+  }
 }
 
-message ParentOrderResponse {
+message SubmitParentOrderResponse {
+  bool accepted = 1;
+  uint64 parent_order_id = 2;  // 0 when rejected
+  string reject_reason = 3;
+}
+
+message CancelParentOrderRequest {
   uint64 parent_order_id = 1;
-  string status = 2;  // "ACCEPTED", "REJECTED"
-  string message = 3;
+}
+
+message CancelParentOrderResponse {
+  bool cancelled = 1;
+  string reason = 2;  // why the order was not cancelled
 }
 
 message OrderStatusRequest {
   uint64 parent_order_id = 1;
 }
 
-message OrderStatusResponse {
-  uint64 parent_order_id = 1;
-  string status = 2;  // "PENDING", "WORKING", "FILLED", "CANCELLED"
-  uint64 filled_qty = 3;
-  double avg_fill_price = 4;
-  repeated ChildOrderStatus children = 5;
+enum ParentOrderState {
+  PARENT_ORDER_STATE_UNSPECIFIED = 0;
+  PARENT_ORDER_STATE_WORKING = 1;    // releasing child orders
+  PARENT_ORDER_STATE_FILLED = 2;     // the full quantity executed
+  PARENT_ORDER_STATE_CANCELLED = 3;  // by request or by the kill switch
+  PARENT_ORDER_STATE_EXPIRED = 4;    // the window ended with quantity unfilled
 }
 
-message ChildOrderStatus {
+message ChildOrderReport {
   uint64 child_order_id = 1;
-  string status = 2;
-  uint64 filled_qty = 3;
+  uint64 sent_at_ns = 2;
+  uint64 quantity = 3;  // includes quantity carried from earlier children
+  uint64 filled_quantity = 4;
+}
+
+message OrderStatusResponse {
+  uint64 parent_order_id = 1;
+  string symbol = 2;
+  Side side = 3;
+  string algorithm = 4;
+  ParentOrderState state = 5;
+  string state_reason = 6;
+  uint64 quantity = 7;
+  uint64 filled_quantity = 8;
+  optional int64 limit_price_ticks = 9;
+  uint64 start_time_ns = 10;
+  uint64 end_time_ns = 11;
+  int64 arrival_mid_ticks = 12;  // mid when the order was accepted
+  optional double average_fill_price_ticks = 13;
+  // Cost against the arrival mid in basis points; positive when worse.
+  optional double shortfall_bps = 14;
+  uint32 pending_slices = 15;  // scheduled child orders not yet released
+  repeated ChildOrderReport children = 16;
+}
+
+message PositionsRequest {
+  string symbol = 1;  // empty for all symbols
+}
+
+message PositionReport {
+  string symbol = 1;
+  int64 quantity = 2;                       // positive long, negative short
+  optional double average_price_ticks = 3;  // unset when flat
+  int64 realized_pnl = 4;                   // ticks x units
+  optional int64 unrealized_pnl = 5;        // ticks x units, at mark_price_ticks
+  optional int64 mark_price_ticks = 6;      // mid; unset without a two-sided market
+}
+
+message PositionsResponse {
+  repeated PositionReport positions = 1;
+  bool trading_halted = 2;
+  string halt_reason = 3;
 }
 
 message StreamFillsRequest {}
 
 message FillEvent {
-  uint64 order_id = 1;
-  uint64 fill_qty = 2;
-  int64 fill_price_ticks = 3;
-  uint64 timestamp_ns = 4;
-}
-
-message PositionsRequest {
-  string symbol = 1;
-}
-
-message PositionsResponse {
-  string symbol = 1;
-  int64 position = 2;
-  double realized_pnl = 3;
-  double unrealized_pnl = 4;
+  uint64 parent_order_id = 1;
+  uint64 child_order_id = 2;
+  string symbol = 3;
+  Side side = 4;
+  int64 price_ticks = 5;
+  uint64 quantity = 6;
+  uint64 timestamp_ns = 7;
 }

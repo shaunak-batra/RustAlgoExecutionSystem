@@ -1,412 +1,298 @@
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+//! Engine server settings, loaded from TOML and validated before use.
+//!
+//! Unknown keys are rejected, so a misspelled setting fails loudly instead of
+//! silently falling back to a default. Money amounts are in price units here;
+//! the engine converts them to integer ticks.
+
+use serde::Deserialize;
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::path::Path;
+use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemConfig {
-    pub engine: EngineConfig,
-    pub market_data: MarketDataConfig,
-    pub risk: RiskConfig,
-    pub database: DatabaseConfig,
-    pub api: ApiConfig,
-    pub gui: GuiConfig,
-    pub algorithms: AlgorithmConfig,
+/// All engine server settings.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    pub engine: EngineSettings,
+    pub api: ApiSettings,
+    pub risk: RiskSettings,
+    pub venue: VenueSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {
-    /// Clock tick interval in milliseconds
-    pub clock_tick_interval_ms: u64,
-    /// Maximum pending orders in the system
-    pub max_pending_orders: usize,
-    /// Enable order routing
-    pub enable_smart_routing: bool,
-    /// Routing retry attempts
-    pub routing_retry_attempts: u32,
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineSettings {
+    /// How often due child orders are released and simulated quotes are
+    /// refreshed, in milliseconds (1 to 60 000).
+    pub tick_interval_ms: u64,
+    /// Capacity of the command channel from the API to the engine task.
+    pub command_buffer: usize,
+    /// How many fills a slow stream subscriber may fall behind before its
+    /// stream ends with DATA_LOSS.
+    pub fill_buffer: usize,
+    /// Finished parent orders kept for status queries.
+    pub retained_finished_orders: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarketDataConfig {
-    /// Market data mode: "websocket" or "rest_api"
-    pub mode: String,
-    /// WebSocket URL (e.g., wss://stream.binance.com:9443/ws)
-    pub websocket_url: String,
-    /// REST API URL (e.g., https://api.binance.com)
-    pub rest_api_url: String,
-    /// Fallback to REST API if WebSocket fails
-    pub fallback_on_ws_failure: bool,
-    /// WebSocket reconnection attempts before fallback
-    pub ws_reconnect_attempts: u32,
-    /// Tick sampling interval in milliseconds (e.g., 10000 for 10 seconds)
-    pub tick_sample_interval_ms: u64,
-    /// REST API polling interval in milliseconds
-    pub rest_poll_interval_ms: u64,
-    /// Symbols to subscribe to
-    pub symbols: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiSettings {
+    /// Address the gRPC server listens on. The API has no authentication, so
+    /// keep it on a loopback address.
+    pub listen_addr: SocketAddr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RiskConfig {
-    /// Maximum position size per symbol
-    pub max_position_size: f64,
-    /// Maximum total exposure across all symbols
-    pub max_total_exposure: f64,
-    /// Stop loss percentage (e.g., 0.02 for 2%)
-    pub stop_loss_pct: f64,
-    /// Take profit percentage (e.g., 0.05 for 5%)
-    pub take_profit_pct: f64,
-    /// Enable real-time risk checks
-    pub enable_risk_checks: bool,
-    /// Maximum daily loss limit
-    pub max_daily_loss: f64,
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RiskSettings {
+    /// Largest quantity of a single parent order.
+    pub max_order_qty: u64,
+    /// Largest notional of a single parent order (price units × units).
+    pub max_order_notional: f64,
+    /// Largest absolute position per symbol, counting working orders.
+    pub max_position_qty: u64,
+    /// Largest gross exposure across symbols (price units × units).
+    pub max_gross_notional: f64,
+    /// Largest distance of a limit price from the mid, in basis points.
+    pub price_collar_bps: u32,
+    /// Trading halts once total P&L falls to `-max_loss` (price units × units).
+    pub max_loss: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseConfig {
-    /// Database file path
-    pub path: String,
-    /// Enable database persistence
-    pub enable_persistence: bool,
-    /// Enable tick data recording
-    pub enable_tick_recording: bool,
-    /// Auto-vacuum database periodically
-    pub auto_vacuum: bool,
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenueSettings {
+    pub symbols: Vec<SymbolSettings>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
-    /// gRPC server host
-    pub host: String,
-    /// gRPC server port
-    pub port: u16,
-    /// Enable server reflection (for grpcurl/debugging)
-    pub enable_reflection: bool,
-    /// Max concurrent streams
-    pub max_concurrent_streams: u32,
+/// One simulated market.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymbolSettings {
+    pub symbol: String,
+    /// Mid price the simulated market maker quotes around.
+    pub reference_price: f64,
+    /// Price levels quoted on each side.
+    pub levels: u32,
+    pub qty_per_level: u64,
+    /// Gap between levels in basis points of the reference price.
+    pub level_spacing_bps: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuiConfig {
-    /// Window title
-    pub window_title: String,
-    /// Initial window width
-    pub window_width: u32,
-    /// Initial window height
-    pub window_height: u32,
-    /// Theme: "light" or "dark"
-    pub theme: String,
-    /// Chart update interval in milliseconds
-    pub chart_update_interval_ms: u64,
-    /// News update interval in milliseconds
-    pub news_update_interval_ms: u64,
-    /// Enable keyboard shortcuts
-    pub enable_keyboard_shortcuts: bool,
+#[derive(Debug, Error)]
+pub enum SettingsError {
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("invalid settings file: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("invalid setting {field}: {reason}")]
+    Invalid { field: String, reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlgorithmConfig {
-    pub twap: TwapConfig,
-    pub pov: PovConfig,
-    pub vwap: VwapConfig,
-    pub is_algo: IsConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TwapConfig {
-    /// Default slice duration in seconds
-    pub default_slice_duration_secs: u64,
-    /// Enable adaptive slicing
-    pub enable_adaptive: bool,
-    /// Adaptive volatility window (number of ticks)
-    pub adaptive_volatility_window: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PovConfig {
-    /// Default participation rate (0.0 to 1.0)
-    pub default_participation_rate: f64,
-    /// Minimum participation rate
-    pub min_participation_rate: f64,
-    /// Maximum participation rate
-    pub max_participation_rate: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VwapConfig {
-    /// Volume profile calculation window in seconds
-    pub volume_profile_window_secs: u64,
-    /// Enable intraday volume curve
-    pub enable_intraday_curve: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IsConfig {
-    /// Risk aversion parameter (lambda in Almgren-Chriss)
-    pub risk_aversion: f64,
-    /// Market impact model: "almgren_chriss" or "linear"
-    pub impact_model: String,
-}
-
-impl SystemConfig {
-    /// Load configuration from a TOML file
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
-
-        let config: SystemConfig = toml::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.as_ref().display()))?;
-
-        config.validate()?;
-        Ok(config)
+impl Settings {
+    /// Reads, parses and validates a settings file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|source| SettingsError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::from_toml_str(&text)
     }
 
-    /// Load configuration from a string
-    pub fn from_toml_str(contents: &str) -> Result<Self> {
-        let config: SystemConfig =
-            toml::from_str(contents).context("Failed to parse config from string")?;
-
-        config.validate()?;
-        Ok(config)
+    /// Parses and validates settings from TOML text.
+    pub fn from_toml_str(text: &str) -> Result<Self, SettingsError> {
+        let settings: Settings = toml::from_str(text)?;
+        settings.validate()?;
+        Ok(settings)
     }
 
-    /// Validate configuration values
-    pub fn validate(&self) -> Result<()> {
-        // Validate market data config
-        if self.market_data.mode != "websocket" && self.market_data.mode != "rest_api" {
-            anyhow::bail!("market_data.mode must be either 'websocket' or 'rest_api'");
-        }
+    /// Checks every value range; the error names the offending field.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let engine = &self.engine;
+        check(
+            "engine.tick_interval_ms",
+            (1..=60_000).contains(&engine.tick_interval_ms),
+            "must be between 1 and 60000",
+        )?;
+        check(
+            "engine.command_buffer",
+            engine.command_buffer > 0,
+            "must be positive",
+        )?;
+        check(
+            "engine.fill_buffer",
+            engine.fill_buffer > 0,
+            "must be positive",
+        )?;
+        check(
+            "engine.retained_finished_orders",
+            engine.retained_finished_orders > 0,
+            "must be positive",
+        )?;
 
-        if self.market_data.tick_sample_interval_ms == 0 {
-            anyhow::bail!("market_data.tick_sample_interval_ms must be greater than 0");
-        }
+        let risk = &self.risk;
+        check(
+            "risk.max_order_qty",
+            risk.max_order_qty > 0,
+            "must be positive",
+        )?;
+        check(
+            "risk.max_position_qty",
+            risk.max_position_qty > 0,
+            "must be positive",
+        )?;
+        positive_amount("risk.max_order_notional", risk.max_order_notional)?;
+        positive_amount("risk.max_gross_notional", risk.max_gross_notional)?;
+        positive_amount("risk.max_loss", risk.max_loss)?;
+        check(
+            "risk.price_collar_bps",
+            (1..=10_000).contains(&risk.price_collar_bps),
+            "must be between 1 and 10000",
+        )?;
 
-        if self.market_data.symbols.is_empty() {
-            anyhow::bail!("market_data.symbols cannot be empty");
+        check(
+            "venue.symbols",
+            !self.venue.symbols.is_empty(),
+            "must list at least one symbol",
+        )?;
+        let mut seen = BTreeSet::new();
+        for (index, symbol) in self.venue.symbols.iter().enumerate() {
+            let field = |name: &str| format!("venue.symbols[{index}].{name}");
+            check(
+                &field("symbol"),
+                !symbol.symbol.trim().is_empty(),
+                "must not be empty",
+            )?;
+            check(
+                &field("symbol"),
+                seen.insert(symbol.symbol.as_str()),
+                "is listed more than once",
+            )?;
+            positive_amount(&field("reference_price"), symbol.reference_price)?;
+            check(
+                &field("levels"),
+                (1..=1_000).contains(&symbol.levels),
+                "must be between 1 and 1000",
+            )?;
+            check(
+                &field("qty_per_level"),
+                symbol.qty_per_level > 0,
+                "must be positive",
+            )?;
+            check(
+                &field("level_spacing_bps"),
+                symbol.level_spacing_bps > 0,
+                "must be positive",
+            )?;
+            check(
+                &field("level_spacing_bps"),
+                u64::from(symbol.levels) * u64::from(symbol.level_spacing_bps) < 10_000,
+                "levels x level_spacing_bps must be below 10000 so every bid stays above zero",
+            )?;
         }
-
-        // Validate risk config
-        if self.risk.max_position_size <= 0.0 {
-            anyhow::bail!("risk.max_position_size must be positive");
-        }
-
-        if self.risk.max_total_exposure <= 0.0 {
-            anyhow::bail!("risk.max_total_exposure must be positive");
-        }
-
-        if self.risk.stop_loss_pct < 0.0 || self.risk.stop_loss_pct > 1.0 {
-            anyhow::bail!("risk.stop_loss_pct must be between 0.0 and 1.0");
-        }
-
-        if self.risk.take_profit_pct <= 0.0 {
-            anyhow::bail!("risk.take_profit_pct must be positive");
-        }
-
-        // Validate GUI config
-        if self.gui.theme != "light" && self.gui.theme != "dark" {
-            anyhow::bail!("gui.theme must be either 'light' or 'dark'");
-        }
-
-        // Validate algorithm configs
-        if self.algorithms.pov.default_participation_rate
-            < self.algorithms.pov.min_participation_rate
-            || self.algorithms.pov.default_participation_rate
-                > self.algorithms.pov.max_participation_rate
-        {
-            anyhow::bail!(
-                "pov.default_participation_rate must be between min_participation_rate and max_participation_rate"
-            );
-        }
-
-        if self.algorithms.is_algo.risk_aversion < 0.0 {
-            anyhow::bail!("is_algo.risk_aversion must be non-negative");
-        }
-
         Ok(())
     }
 }
 
-impl Default for SystemConfig {
-    /// Create a default configuration
-    fn default() -> Self {
-        Self {
-            engine: EngineConfig {
-                clock_tick_interval_ms: 100,
-                max_pending_orders: 10000,
-                enable_smart_routing: false,
-                routing_retry_attempts: 3,
-            },
-            market_data: MarketDataConfig {
-                mode: "rest_api".to_string(),
-                websocket_url: "wss://stream.binance.com:9443/ws".to_string(),
-                rest_api_url: "https://api.binance.com".to_string(),
-                fallback_on_ws_failure: true,
-                ws_reconnect_attempts: 5,
-                tick_sample_interval_ms: 10000,
-                rest_poll_interval_ms: 2000,
-                symbols: vec!["btcusdt".to_string(), "ethusdt".to_string()],
-            },
-            risk: RiskConfig {
-                max_position_size: 100000.0,
-                max_total_exposure: 500000.0,
-                stop_loss_pct: 0.02,
-                take_profit_pct: 0.05,
-                enable_risk_checks: true,
-                max_daily_loss: 10000.0,
-            },
-            database: DatabaseConfig {
-                path: "trading_system.db".to_string(),
-                enable_persistence: true,
-                enable_tick_recording: true,
-                auto_vacuum: true,
-            },
-            api: ApiConfig {
-                host: "127.0.0.1".to_string(),
-                port: 50051,
-                enable_reflection: true,
-                max_concurrent_streams: 100,
-            },
-            gui: GuiConfig {
-                window_title: "Algorithmic Trading System".to_string(),
-                window_width: 1400,
-                window_height: 900,
-                theme: "dark".to_string(),
-                chart_update_interval_ms: 500,
-                news_update_interval_ms: 5000,
-                enable_keyboard_shortcuts: true,
-            },
-            algorithms: AlgorithmConfig {
-                twap: TwapConfig {
-                    default_slice_duration_secs: 60,
-                    enable_adaptive: false,
-                    adaptive_volatility_window: 20,
-                },
-                pov: PovConfig {
-                    default_participation_rate: 0.1,
-                    min_participation_rate: 0.01,
-                    max_participation_rate: 0.5,
-                },
-                vwap: VwapConfig {
-                    volume_profile_window_secs: 3600,
-                    enable_intraday_curve: true,
-                },
-                is_algo: IsConfig {
-                    risk_aversion: 1.0,
-                    impact_model: "almgren_chriss".to_string(),
-                },
-            },
-        }
+fn check(field: &str, ok: bool, reason: &str) -> Result<(), SettingsError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(SettingsError::Invalid {
+            field: field.to_string(),
+            reason: reason.to_string(),
+        })
     }
+}
+
+fn positive_amount(field: &str, value: f64) -> Result<(), SettingsError> {
+    check(
+        field,
+        value.is_finite() && value > 0.0,
+        "must be a finite positive number",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_default_config_is_valid() {
-        let config = SystemConfig::default();
-        assert!(config.validate().is_ok());
+    const SHIPPED: &str = include_str!("../../../config/default.toml");
+
+    fn invalid_field(settings: &Settings) -> String {
+        match settings.validate() {
+            Err(SettingsError::Invalid { field, .. }) => field,
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_invalid_market_data_mode() {
-        let mut config = SystemConfig::default();
-        config.market_data.mode = "invalid".to_string();
-        assert!(config.validate().is_err());
+    fn shipped_default_config_is_valid() {
+        let settings = Settings::from_toml_str(SHIPPED).unwrap();
+        assert!(settings.api.listen_addr.ip().is_loopback());
+        assert!(!settings.venue.symbols.is_empty());
     }
 
     #[test]
-    fn test_invalid_stop_loss_pct() {
-        let mut config = SystemConfig::default();
-        config.risk.stop_loss_pct = 1.5;
-        assert!(config.validate().is_err());
+    fn unknown_keys_are_rejected() {
+        let misspelled = SHIPPED.replace("[engine]", "[engine]\ntick_intervall_ms = 5");
+        assert!(matches!(
+            Settings::from_toml_str(&misspelled),
+            Err(SettingsError::Parse(_))
+        ));
     }
 
     #[test]
-    fn test_invalid_gui_theme() {
-        let mut config = SystemConfig::default();
-        config.gui.theme = "rainbow".to_string();
-        assert!(config.validate().is_err());
+    fn invalid_values_name_the_field() {
+        let base = Settings::from_toml_str(SHIPPED).unwrap();
+
+        let mut settings = base.clone();
+        settings.engine.tick_interval_ms = 0;
+        assert_eq!(invalid_field(&settings), "engine.tick_interval_ms");
+
+        let mut settings = base.clone();
+        settings.risk.max_loss = f64::NAN;
+        assert_eq!(invalid_field(&settings), "risk.max_loss");
+
+        let mut settings = base.clone();
+        settings.risk.price_collar_bps = 10_001;
+        assert_eq!(invalid_field(&settings), "risk.price_collar_bps");
+
+        let mut settings = base.clone();
+        settings.venue.symbols.clear();
+        assert_eq!(invalid_field(&settings), "venue.symbols");
+
+        let mut settings = base.clone();
+        let duplicate = settings.venue.symbols[0].clone();
+        settings.venue.symbols.push(duplicate);
+        assert_eq!(
+            invalid_field(&settings),
+            format!("venue.symbols[{}].symbol", base.venue.symbols.len())
+        );
+
+        let mut settings = base.clone();
+        settings.venue.symbols[0].reference_price = -1.0;
+        assert_eq!(invalid_field(&settings), "venue.symbols[0].reference_price");
+
+        let mut settings = base;
+        settings.venue.symbols[0].levels = 100;
+        settings.venue.symbols[0].level_spacing_bps = 100;
+        assert_eq!(
+            invalid_field(&settings),
+            "venue.symbols[0].level_spacing_bps"
+        );
     }
 
     #[test]
-    fn test_invalid_pov_participation_rate() {
-        let mut config = SystemConfig::default();
-        config.algorithms.pov.default_participation_rate = 0.8;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_load_from_string() {
-        let toml_str = r#"
-[engine]
-clock_tick_interval_ms = 100
-max_pending_orders = 10000
-enable_smart_routing = false
-routing_retry_attempts = 3
-
-[market_data]
-mode = "rest_api"
-websocket_url = "wss://stream.binance.com:9443/ws"
-rest_api_url = "https://api.binance.com"
-fallback_on_ws_failure = true
-ws_reconnect_attempts = 5
-tick_sample_interval_ms = 10000
-rest_poll_interval_ms = 2000
-symbols = ["btcusdt", "ethusdt"]
-
-[risk]
-max_position_size = 100000.0
-max_total_exposure = 500000.0
-stop_loss_pct = 0.02
-take_profit_pct = 0.05
-enable_risk_checks = true
-max_daily_loss = 10000.0
-
-[database]
-path = "trading_system.db"
-enable_persistence = true
-enable_tick_recording = true
-auto_vacuum = true
-
-[api]
-host = "127.0.0.1"
-port = 50051
-enable_reflection = true
-max_concurrent_streams = 100
-
-[gui]
-window_title = "Algorithmic Trading System"
-window_width = 1400
-window_height = 900
-theme = "dark"
-chart_update_interval_ms = 500
-news_update_interval_ms = 5000
-enable_keyboard_shortcuts = true
-
-[algorithms.twap]
-default_slice_duration_secs = 60
-enable_adaptive = false
-adaptive_volatility_window = 20
-
-[algorithms.pov]
-default_participation_rate = 0.1
-min_participation_rate = 0.01
-max_participation_rate = 0.5
-
-[algorithms.vwap]
-volume_profile_window_secs = 3600
-enable_intraday_curve = true
-
-[algorithms.is_algo]
-risk_aversion = 1.0
-impact_model = "almgren_chriss"
-        "#;
-
-        let config = SystemConfig::from_toml_str(toml_str);
-        assert!(config.is_ok());
-        let config = config.unwrap();
-        assert_eq!(config.market_data.mode, "rest_api");
-        assert_eq!(config.gui.theme, "dark");
+    fn missing_file_is_a_read_error() {
+        assert!(matches!(
+            Settings::load("does/not/exist.toml"),
+            Err(SettingsError::Read { .. })
+        ));
     }
 }
