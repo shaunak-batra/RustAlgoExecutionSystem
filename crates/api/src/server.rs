@@ -181,9 +181,9 @@ impl ExecutionService for ExecutionServiceImpl {
                 match fill_rx.recv().await {
                     Ok(fill) => {
                         let fill_event = FillEvent {
-                            order_id: fill.order_id.value(),
-                            fill_qty: fill.fill_qty.value(),
-                            fill_price_ticks: fill.fill_price.ticks(),
+                            order_id: fill.taker_order_id.value(),
+                            fill_qty: fill.qty.value(),
+                            fill_price_ticks: fill.price.ticks(),
                             timestamp_ns: fill.timestamp.nanos(),
                         };
 

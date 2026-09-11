@@ -1,15 +1,28 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use thiserror::Error;
 
-/// Newtype for prices (in basis points or ticks) to prevent accidental arithmetic with quantities.
-/// Using i64 to allow for signed prices if needed (e.g., spreads).
-/// Example: 100_000 = $1.00 if tick=0.0001
+/// Fixed-point price in integer ticks.
+///
+/// One tick is `1 / TICK_SCALE` currency units (five decimal places). Prices stay
+/// integers inside the book, so level lookup and comparisons are exact; floating
+/// point is only used at the boundaries (user input and display).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct Price(pub i64);
 
+/// Error converting a floating-point price to ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Error)]
+pub enum PriceError {
+    #[error("price must be a finite number, got {0}")]
+    NotFinite(f64),
+    #[error("price {0} does not fit in the tick range")]
+    OutOfRange(f64),
+}
+
 impl Price {
     pub const ZERO: Self = Price(0);
+    /// Ticks per currency unit.
     pub const TICK_SCALE: f64 = 100_000.0;
 
     #[inline]
@@ -17,9 +30,29 @@ impl Price {
         Price(ticks)
     }
 
+    /// Converts a decimal price to the nearest tick.
+    ///
+    /// Rounds instead of truncating: `0.29 * 100_000.0` is `28999.999...` in
+    /// floating point, which truncation would turn into the wrong tick. NaN maps
+    /// to zero and out-of-range values saturate, so use [`Price::try_from_f64`]
+    /// for untrusted input.
     #[inline]
     pub fn from_f64(price: f64) -> Self {
-        Price((price * Self::TICK_SCALE) as i64)
+        Price((price * Self::TICK_SCALE).round() as i64)
+    }
+
+    /// Converts a decimal price to the nearest tick, rejecting NaN, infinities,
+    /// and values outside the `i64` tick range.
+    pub fn try_from_f64(price: f64) -> Result<Self, PriceError> {
+        if !price.is_finite() {
+            return Err(PriceError::NotFinite(price));
+        }
+        let ticks = (price * Self::TICK_SCALE).round();
+        // -2^63 is exactly representable; 2^63 is one past i64::MAX.
+        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&ticks) {
+            return Err(PriceError::OutOfRange(price));
+        }
+        Ok(Price(ticks as i64))
     }
 
     #[inline]
@@ -35,7 +68,7 @@ impl Price {
 
 impl fmt::Display for Price {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "${:.5}", self.as_f64())
+        write!(f, "{:.5}", self.as_f64())
     }
 }
 
@@ -55,6 +88,21 @@ impl Quantity {
     #[inline]
     pub const fn value(&self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    pub const fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Quantity)
+    }
+
+    #[inline]
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
+        self.0.checked_sub(other.0).map(Quantity)
     }
 
     #[inline]
@@ -114,15 +162,15 @@ impl std::str::FromStr for Side {
 /// Time-in-force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeInForce {
-    /// Good-till-cancelled
+    /// Good-till-cancelled: any unfilled remainder rests in the book.
     GTC,
-    /// Immediate-or-cancel
+    /// Immediate-or-cancel: trade what is available now, cancel the rest.
     IOC,
-    /// Fill-or-kill
+    /// Fill-or-kill: trade the full quantity now, or nothing at all.
     FOK,
 }
 
-/// Unique order identifier (u64 for simplicity; consider UUIDv7 for distributed systems).
+/// Unique order identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct OrderId(pub u64);
@@ -145,7 +193,7 @@ impl fmt::Display for OrderId {
     }
 }
 
-/// Timestamp in nanoseconds since epoch (or simulation start).
+/// Timestamp in nanoseconds since the Unix epoch (or simulation start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct Timestamp(pub u64);
@@ -156,15 +204,16 @@ impl Timestamp {
         Timestamp(nanos)
     }
 
+    /// Current wall-clock time. A clock set before 1970 yields 0; values past
+    /// `u64::MAX` nanoseconds (year 2554) saturate.
     #[inline]
     pub fn now_nanos() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        Timestamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_nanos() as u64,
-        )
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        Timestamp(nanos)
     }
 
     #[inline]
@@ -196,6 +245,55 @@ mod tests {
     }
 
     #[test]
+    fn price_rounds_to_nearest_tick() {
+        // 0.29 * 100_000.0 == 28999.999999999996; truncation would give 28_999.
+        assert_eq!(Price::from_f64(0.29).ticks(), 29_000);
+        assert_eq!(Price::from_f64(-0.29).ticks(), -29_000);
+        assert_eq!(Price::from_f64(1.1).ticks(), 110_000);
+    }
+
+    #[test]
+    fn every_cent_price_converts_exactly() {
+        for cents in 1..=1_000_000i64 {
+            let price = cents as f64 / 100.0;
+            assert_eq!(
+                Price::from_f64(price).ticks(),
+                cents * 1_000,
+                "price {price}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tick_price_round_trips() {
+        for ticks in 1..=200_000i64 {
+            let price = Price::new(ticks);
+            assert_eq!(Price::from_f64(price.as_f64()), price);
+        }
+    }
+
+    #[test]
+    fn try_from_f64_rejects_invalid_input() {
+        assert!(matches!(
+            Price::try_from_f64(f64::NAN),
+            Err(PriceError::NotFinite(_))
+        ));
+        assert!(matches!(
+            Price::try_from_f64(f64::NEG_INFINITY),
+            Err(PriceError::NotFinite(_))
+        ));
+        assert!(matches!(
+            Price::try_from_f64(1e300),
+            Err(PriceError::OutOfRange(_))
+        ));
+        assert!(matches!(
+            Price::try_from_f64(-1e300),
+            Err(PriceError::OutOfRange(_))
+        ));
+        assert_eq!(Price::try_from_f64(123.45678), Ok(Price::new(12_345_678)));
+    }
+
+    #[test]
     fn test_price_ordering() {
         let p1 = Price::new(100);
         let p2 = Price::new(200);
@@ -208,6 +306,17 @@ mod tests {
         let q2 = Quantity::new(50);
         assert_eq!(q1.saturating_sub(q2), Quantity::new(50));
         assert_eq!(q2.saturating_sub(q1), Quantity::ZERO);
+    }
+
+    #[test]
+    fn quantity_checked_ops() {
+        assert_eq!(
+            Quantity::new(5).checked_add(Quantity::new(6)),
+            Some(Quantity::new(11))
+        );
+        assert_eq!(Quantity::new(u64::MAX).checked_add(Quantity::new(1)), None);
+        assert_eq!(Quantity::new(5).checked_sub(Quantity::new(6)), None);
+        assert!(Quantity::ZERO.is_zero());
     }
 
     #[test]

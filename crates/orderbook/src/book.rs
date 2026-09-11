@@ -1,48 +1,50 @@
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use thiserror::Error;
 
-/// Single-symbol order book with price-time priority matching.
-#[derive(Debug, Clone)]
-pub struct OrderBook {
-    symbol: String,
-    /// Bid levels: descending price (highest first)
-    bids: BTreeMap<Price, VecDeque<Order>>,
-    /// Ask levels: ascending price (lowest first)
-    asks: BTreeMap<Price, VecDeque<Order>>,
-    /// Track total volume at each level
-    bid_depth: BTreeMap<Price, Quantity>,
-    ask_depth: BTreeMap<Price, Quantity>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An order submitted to the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub side: Side,
-    pub price: Price,
+    /// Limit price. `None` makes this a market order, which must be IOC or FOK.
+    pub limit_price: Option<Price>,
     pub qty: Quantity,
+    /// Informational. Queue priority is arrival order, not this value.
     pub timestamp: Timestamp,
     pub tif: TimeInForce,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fill {
-    pub order_id: OrderId,
-    pub fill_price: Price,
-    pub fill_qty: Quantity,
-    pub timestamp: Timestamp,
-    pub is_maker: bool,
-}
-
 impl Order {
-    pub fn new(id: OrderId, side: Side, price: Price, qty: Quantity, timestamp: Timestamp) -> Self {
+    /// Good-till-cancelled limit order.
+    pub fn limit(
+        id: OrderId,
+        side: Side,
+        price: Price,
+        qty: Quantity,
+        timestamp: Timestamp,
+    ) -> Self {
         Self {
             id,
             side,
-            price,
+            limit_price: Some(price),
             qty,
             timestamp,
             tif: TimeInForce::GTC,
+        }
+    }
+
+    /// Market order: trades at the best available prices and cancels any
+    /// unfilled remainder (IOC). Use [`Order::with_tif`] for a market FOK.
+    pub fn market(id: OrderId, side: Side, qty: Quantity, timestamp: Timestamp) -> Self {
+        Self {
+            id,
+            side,
+            limit_price: None,
+            qty,
+            timestamp,
+            tif: TimeInForce::IOC,
         }
     }
 
@@ -50,6 +52,101 @@ impl Order {
         self.tif = tif;
         self
     }
+
+    /// Whether this order is willing to trade against a resting order at `price`.
+    fn accepts(&self, price: Price) -> bool {
+        match (self.side, self.limit_price) {
+            (_, None) => true,
+            (Side::Buy, Some(limit)) => price <= limit,
+            (Side::Sell, Some(limit)) => price >= limit,
+        }
+    }
+}
+
+/// One match between an incoming (taker) order and a resting (maker) order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fill {
+    pub taker_order_id: OrderId,
+    pub maker_order_id: OrderId,
+    /// Side of the taker; the maker is on the opposite side.
+    pub taker_side: Side,
+    /// Execution price: always the maker's resting price.
+    pub price: Price,
+    pub qty: Quantity,
+    /// Timestamp of the taker order that caused the match.
+    pub timestamp: Timestamp,
+}
+
+/// What happened to a submitted order after matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderOutcome {
+    /// The full quantity traded.
+    Filled,
+    /// A GTC remainder is now resting in the book.
+    Resting { remaining: Quantity },
+    /// An IOC or market remainder was cancelled (possibly after partial fills).
+    Cancelled { remaining: Quantity },
+    /// A FOK order could not trade its full quantity; nothing traded and the
+    /// book is unchanged.
+    Killed,
+}
+
+/// Execution report for a submitted order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitResult {
+    /// Matches in execution order.
+    pub fills: Vec<Fill>,
+    /// Sum of `fills[i].qty`.
+    pub filled_qty: Quantity,
+    pub outcome: OrderOutcome,
+}
+
+/// Reasons an order is rejected before it touches the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum OrderError {
+    #[error("order quantity must be greater than zero")]
+    ZeroQuantity,
+    #[error("limit price must be positive, got {0} ticks")]
+    NonPositivePrice(i64),
+    #[error("market orders must be IOC or FOK")]
+    MarketOrderCannotRest,
+    #[error("order id {0} is already resting in the book")]
+    DuplicateOrderId(u64),
+    #[error("resting quantity at this price level would overflow u64")]
+    LevelQuantityOverflow,
+}
+
+/// Orders resting at one price, in arrival order.
+#[derive(Debug, Clone, Default)]
+struct Level {
+    /// Front has the highest time priority.
+    orders: VecDeque<Order>,
+    /// Sum of the resting quantities, maintained incrementally.
+    total_qty: u64,
+}
+
+/// Single-symbol limit order book with price-time priority.
+///
+/// Matching rules:
+/// - A trade executes at the resting (maker) order's price.
+/// - The best price level fills first; within a level, earlier orders fill first.
+/// - A partially filled resting order keeps its place in the queue.
+///
+/// Complexity, with `L` price levels on a side and `k` orders at one level:
+/// - [`submit_order`](Self::submit_order): `O(log L)` per price level touched
+///   plus `O(1)` per resting order filled
+/// - [`cancel_order`](Self::cancel_order): expected `O(1)` index lookup,
+///   `O(log L)` level lookup, `O(k)` scan within the level
+/// - [`best_bid`](Self::best_bid) / [`best_ask`](Self::best_ask): `O(log L)`
+///
+/// Self-trade prevention is not modelled: the book has no notion of order owners.
+#[derive(Debug, Clone)]
+pub struct OrderBook {
+    symbol: String,
+    bids: BTreeMap<Price, Level>,
+    asks: BTreeMap<Price, Level>,
+    /// Resting order id -> (side, price), so cancels do not scan the book.
+    index: HashMap<OrderId, (Side, Price)>,
 }
 
 impl OrderBook {
@@ -58,8 +155,7 @@ impl OrderBook {
             symbol,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            bid_depth: BTreeMap::new(),
-            ask_depth: BTreeMap::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -67,194 +163,70 @@ impl OrderBook {
         &self.symbol
     }
 
-    /// Insert a limit order; returns immediate fills if marketable.
-    /// Implements price-time priority matching.
-    pub fn insert_order(&mut self, mut order: Order) -> Vec<Fill> {
-        let mut fills = Vec::new();
+    /// Submits an order: matches it against the opposite side, then rests any
+    /// GTC remainder at its limit price.
+    ///
+    /// - `GTC` limit: the unfilled remainder rests.
+    /// - `IOC` and market orders: trade what is available, cancel the rest.
+    /// - `FOK`: trade the full quantity immediately, or nothing (the book is
+    ///   left unchanged).
+    ///
+    /// Invalid orders return `Err` and leave the book unchanged.
+    pub fn submit_order(&mut self, order: Order) -> Result<SubmitResult, OrderError> {
+        self.validate(&order)?;
 
-        match order.side {
-            Side::Buy => {
-                // Match against asks (ascending price).
-                while order.qty > Quantity::ZERO {
-                    // Get the best (lowest) ask
-                    let best_ask_price = self.asks.keys().next().copied();
-
-                    match best_ask_price {
-                        Some(ask_price) if ask_price <= order.price => {
-                            let fill_qty;
-                            let queue_empty;
-
-                            {
-                                let ask_queue = self.asks.get_mut(&ask_price).unwrap();
-
-                                if let Some(mut resting_order) = ask_queue.pop_front() {
-                                    fill_qty = Quantity::new(order.qty.0.min(resting_order.qty.0));
-
-                                    fills.push(Fill {
-                                        order_id: order.id,
-                                        fill_price: ask_price,
-                                        fill_qty,
-                                        timestamp: Timestamp::now_nanos(),
-                                        is_maker: false,
-                                    });
-
-                                    order.qty.0 -= fill_qty.0;
-                                    resting_order.qty.0 -= fill_qty.0;
-
-                                    if resting_order.qty > Quantity::ZERO {
-                                        ask_queue.push_front(resting_order);
-                                    }
-
-                                    queue_empty = ask_queue.is_empty();
-                                } else {
-                                    break;
-                                }
-                            }
-
-                            // Update depth after fill
-                            self.ask_depth
-                                .entry(ask_price)
-                                .and_modify(|q| *q = q.saturating_sub(fill_qty));
-
-                            if queue_empty {
-                                self.asks.remove(&ask_price);
-                                self.ask_depth.remove(&ask_price);
-                            }
-
-                            if order.tif == TimeInForce::IOC && order.qty > Quantity::ZERO {
-                                return fills;
-                            }
-                        }
-                        _ => {
-                            // No more matches or limit price reached
-                            if order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK {
-                                // Cancel unfilled portion
-                                if order.tif == TimeInForce::FOK && order.qty > Quantity::ZERO {
-                                    // FOK not fully filled - reject all (prevent partial fills)
-                                    return Vec::new();
-                                }
-                                return fills;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // Rest stays on bid side if any qty remaining and GTC
-                if order.qty > Quantity::ZERO && order.tif == TimeInForce::GTC {
-                    self.bid_depth
-                        .entry(order.price)
-                        .and_modify(|q| *q = q.saturating_add(order.qty))
-                        .or_insert(order.qty);
-                    self.bids.entry(order.price).or_default().push_back(order);
-                }
-            }
-
-            Side::Sell => {
-                // Match against bids (descending price).
-                while order.qty > Quantity::ZERO {
-                    // Get the best (highest) bid
-                    let best_bid_price = self.bids.keys().next_back().copied();
-
-                    match best_bid_price {
-                        Some(bid_price) if bid_price >= order.price => {
-                            let fill_qty;
-                            let queue_empty;
-
-                            {
-                                let bid_queue = self.bids.get_mut(&bid_price).unwrap();
-
-                                if let Some(mut resting_order) = bid_queue.pop_front() {
-                                    fill_qty = Quantity::new(order.qty.0.min(resting_order.qty.0));
-
-                                    fills.push(Fill {
-                                        order_id: order.id,
-                                        fill_price: bid_price,
-                                        fill_qty,
-                                        timestamp: Timestamp::now_nanos(),
-                                        is_maker: false,
-                                    });
-
-                                    order.qty.0 -= fill_qty.0;
-                                    resting_order.qty.0 -= fill_qty.0;
-
-                                    if resting_order.qty > Quantity::ZERO {
-                                        bid_queue.push_front(resting_order);
-                                    }
-
-                                    queue_empty = bid_queue.is_empty();
-                                } else {
-                                    break;
-                                }
-                            }
-
-                            // Update depth after fill
-                            self.bid_depth
-                                .entry(bid_price)
-                                .and_modify(|q| *q = q.saturating_sub(fill_qty));
-
-                            if queue_empty {
-                                self.bids.remove(&bid_price);
-                                self.bid_depth.remove(&bid_price);
-                            }
-
-                            if order.tif == TimeInForce::IOC && order.qty > Quantity::ZERO {
-                                return fills;
-                            }
-                        }
-                        _ => {
-                            // No more matches
-                            if order.tif == TimeInForce::IOC || order.tif == TimeInForce::FOK {
-                                if order.tif == TimeInForce::FOK && order.qty > Quantity::ZERO {
-                                    // FOK not fully filled - reject all (prevent partial fills)
-                                    return Vec::new();
-                                }
-                                return fills;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // Rest stays on ask side if any qty remaining and GTC
-                if order.qty > Quantity::ZERO && order.tif == TimeInForce::GTC {
-                    self.ask_depth
-                        .entry(order.price)
-                        .and_modify(|q| *q = q.saturating_add(order.qty))
-                        .or_insert(order.qty);
-                    self.asks.entry(order.price).or_default().push_back(order);
-                }
-            }
+        if order.tif == TimeInForce::FOK && self.executable_qty(&order) < order.qty.value() {
+            return Ok(SubmitResult {
+                fills: Vec::new(),
+                filled_qty: Quantity::ZERO,
+                outcome: OrderOutcome::Killed,
+            });
         }
 
-        fills
+        let mut order = order;
+        let requested = order.qty;
+        let fills = self.match_against_book(&mut order);
+        let filled_qty = Quantity::new(requested.value() - order.qty.value());
+
+        let outcome = match (order.tif, order.limit_price) {
+            _ if order.qty.is_zero() => OrderOutcome::Filled,
+            (TimeInForce::GTC, Some(price)) => {
+                let remaining = order.qty;
+                self.rest(order, price);
+                OrderOutcome::Resting { remaining }
+            }
+            // IOC and market remainders. (FOK is fully filled by construction,
+            // and a GTC market order was rejected during validation.)
+            _ => OrderOutcome::Cancelled {
+                remaining: order.qty,
+            },
+        };
+
+        Ok(SubmitResult {
+            fills,
+            filled_qty,
+            outcome,
+        })
     }
 
-    #[allow(dead_code)]
-    fn update_depth(&mut self, price: &Price, side: &Side, _add: bool) {
-        // Placeholder for depth tracking updates
-        match side {
-            Side::Buy => {
-                if let Some(queue) = self.bids.get(price) {
-                    let total: u64 = queue.iter().map(|o| o.qty.0).sum();
-                    if total > 0 {
-                        self.bid_depth.insert(*price, Quantity::new(total));
-                    } else {
-                        self.bid_depth.remove(price);
-                    }
-                }
-            }
-            Side::Sell => {
-                if let Some(queue) = self.asks.get(price) {
-                    let total: u64 = queue.iter().map(|o| o.qty.0).sum();
-                    if total > 0 {
-                        self.ask_depth.insert(*price, Quantity::new(total));
-                    } else {
-                        self.ask_depth.remove(price);
-                    }
-                }
-            }
+    /// Cancels a resting order and returns it with its remaining quantity.
+    ///
+    /// Returns `None` if no order with this id is resting: it never existed,
+    /// was fully filled, or was already cancelled.
+    pub fn cancel_order(&mut self, id: OrderId) -> Option<Order> {
+        let (side, price) = self.index.remove(&id)?;
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let level = levels.get_mut(&price)?;
+        let position = level.orders.iter().position(|order| order.id == id)?;
+        let order = level.orders.remove(position)?;
+        level.total_qty -= order.qty.value();
+        if level.orders.is_empty() {
+            levels.remove(&price);
         }
+        Some(order)
     }
 
     pub fn best_bid(&self) -> Option<Price> {
@@ -265,141 +237,247 @@ impl OrderBook {
         self.asks.keys().next().copied()
     }
 
+    /// Midpoint of the best bid and best ask, rounded down to a whole tick.
     pub fn mid(&self) -> Option<Price> {
-        match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some(Price((bid.0 + ask.0) / 2)),
-            _ => None,
-        }
+        let (bid, ask) = (self.best_bid()?, self.best_ask()?);
+        let sum = i128::from(bid.ticks()) + i128::from(ask.ticks());
+        Some(Price::new((sum / 2) as i64))
     }
 
     pub fn spread(&self) -> Option<Price> {
-        match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some(Price(ask.0 - bid.0)),
-            _ => None,
-        }
+        Some(Price::new(
+            self.best_ask()?.ticks() - self.best_bid()?.ticks(),
+        ))
     }
 
-    /// Get total bid depth at price level
+    /// Total resting bid quantity at `price`.
     pub fn bid_qty_at(&self, price: Price) -> Quantity {
-        self.bid_depth
-            .get(&price)
-            .copied()
-            .unwrap_or(Quantity::ZERO)
+        Quantity::new(self.level_qty(Side::Buy, price))
     }
 
-    /// Get total ask depth at price level
+    /// Total resting ask quantity at `price`.
     pub fn ask_qty_at(&self, price: Price) -> Quantity {
-        self.ask_depth
-            .get(&price)
-            .copied()
-            .unwrap_or(Quantity::ZERO)
+        Quantity::new(self.level_qty(Side::Sell, price))
     }
 
-    /// Get top N levels of bids (highest first)
+    /// Top `n` bid levels as `(price, total quantity)`, highest price first.
     pub fn bid_levels(&self, n: usize) -> Vec<(Price, Quantity)> {
         self.bids
             .iter()
             .rev()
             .take(n)
-            .map(|(p, q)| (*p, Quantity::new(q.iter().map(|o| o.qty.0).sum())))
+            .map(|(price, level)| (*price, Quantity::new(level.total_qty)))
             .collect()
     }
 
-    /// Get top N levels of asks (lowest first)
+    /// Top `n` ask levels as `(price, total quantity)`, lowest price first.
     pub fn ask_levels(&self, n: usize) -> Vec<(Price, Quantity)> {
         self.asks
             .iter()
             .take(n)
-            .map(|(p, q)| (*p, Quantity::new(q.iter().map(|o| o.qty.0).sum())))
+            .map(|(price, level)| (*price, Quantity::new(level.total_qty)))
             .collect()
     }
 
-    /// Seed the orderbook with market maker liquidity at a reference price
-    /// This creates BUY and SELL orders to provide liquidity for testing
-    pub fn seed_market_maker(
-        &mut self,
-        mid_price: Price,
-        num_levels: usize,
-        qty_per_level: Quantity,
-    ) {
-        let mut order_id = 9_000_000_000_000_000_000u64; // Use high IDs for MM orders
+    /// Number of resting orders on both sides.
+    pub fn order_count(&self) -> usize {
+        self.index.len()
+    }
 
-        // Add ask (sell) orders above mid price
-        for i in 1..=num_levels {
-            let price_offset = (mid_price.0 as f64 * 0.0001 * i as f64) as i64; // 0.01% spread per level
-            let ask_price = Price(mid_price.0 + price_offset);
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
 
-            let order = Order::new(
-                OrderId(order_id),
-                Side::Sell,
-                ask_price,
-                qty_per_level,
-                Timestamp::now_nanos(),
-            );
+    pub fn contains_order(&self, id: OrderId) -> bool {
+        self.index.contains_key(&id)
+    }
 
-            self.asks.entry(ask_price).or_default().push_back(order);
+    /// A resting order with its current (remaining) quantity.
+    pub fn resting_order(&self, id: OrderId) -> Option<&Order> {
+        let (side, price) = self.index.get(&id)?;
+        self.levels(*side)
+            .get(price)?
+            .orders
+            .iter()
+            .find(|order| order.id == id)
+    }
 
-            self.ask_depth
-                .entry(ask_price)
-                .and_modify(|q| q.0 += qty_per_level.0)
-                .or_insert(qty_per_level);
-
-            order_id += 1;
+    /// Checks every internal consistency rule of the book in `O(n)`:
+    /// no empty levels, cached level totals match their orders, the id index
+    /// matches the resting orders exactly, resting orders are GTC limit orders
+    /// on the right side and level, and the book is not crossed.
+    ///
+    /// Intended for tests and debugging; returns a description of the first
+    /// violation found.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let mut resting = 0usize;
+        for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (&price, level) in levels {
+                if level.orders.is_empty() {
+                    return Err(format!("empty {side} level at {price}"));
+                }
+                let mut total = 0u64;
+                for order in &level.orders {
+                    if order.qty.is_zero() {
+                        return Err(format!("{} rests with zero quantity", order.id));
+                    }
+                    if order.side != side || order.limit_price != Some(price) {
+                        return Err(format!("{} rests at the wrong side or level", order.id));
+                    }
+                    if order.tif != TimeInForce::GTC {
+                        return Err(format!("{} rests with {:?}", order.id, order.tif));
+                    }
+                    if self.index.get(&order.id) != Some(&(side, price)) {
+                        return Err(format!("index entry for {} is missing or stale", order.id));
+                    }
+                    total = total
+                        .checked_add(order.qty.value())
+                        .ok_or_else(|| format!("{side} level {price} total overflows"))?;
+                    resting += 1;
+                }
+                if total != level.total_qty {
+                    return Err(format!(
+                        "{side} level {price} caches {} but holds {total}",
+                        level.total_qty
+                    ));
+                }
+            }
         }
+        if resting != self.index.len() {
+            return Err(format!(
+                "index has {} entries for {resting} resting orders",
+                self.index.len()
+            ));
+        }
+        if let (Some(bid), Some(ask)) = (self.best_bid(), self.best_ask()) {
+            if bid >= ask {
+                return Err(format!("book is crossed: bid {bid} >= ask {ask}"));
+            }
+        }
+        Ok(())
+    }
 
-        // Add bid (buy) orders below mid price
-        for i in 1..=num_levels {
-            let price_offset = (mid_price.0 as f64 * 0.0001 * i as f64) as i64; // 0.01% spread per level
-            let bid_price = Price(mid_price.0 - price_offset);
+    fn validate(&self, order: &Order) -> Result<(), OrderError> {
+        if order.qty.is_zero() {
+            return Err(OrderError::ZeroQuantity);
+        }
+        match order.limit_price {
+            Some(price) if price.ticks() <= 0 => {
+                return Err(OrderError::NonPositivePrice(price.ticks()));
+            }
+            Some(price) if order.tif == TimeInForce::GTC => {
+                // The whole quantity may end up resting at this level.
+                if self
+                    .level_qty(order.side, price)
+                    .checked_add(order.qty.value())
+                    .is_none()
+                {
+                    return Err(OrderError::LevelQuantityOverflow);
+                }
+            }
+            None if order.tif == TimeInForce::GTC => {
+                return Err(OrderError::MarketOrderCannotRest);
+            }
+            _ => {}
+        }
+        if self.index.contains_key(&order.id) {
+            return Err(OrderError::DuplicateOrderId(order.id.value()));
+        }
+        Ok(())
+    }
 
-            let order = Order::new(
-                OrderId(order_id),
-                Side::Buy,
-                bid_price,
-                qty_per_level,
-                Timestamp::now_nanos(),
-            );
-
-            self.bids.entry(bid_price).or_default().push_back(order);
-
-            self.bid_depth
-                .entry(bid_price)
-                .and_modify(|q| q.0 += qty_per_level.0)
-                .or_insert(qty_per_level);
-
-            order_id += 1;
+    fn levels(&self, side: Side) -> &BTreeMap<Price, Level> {
+        match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
         }
     }
 
-    /// Cancel an order by ID
-    pub fn cancel_order(&mut self, order_id: OrderId) -> Option<Order> {
-        // Search in bids
-        for (price, queue) in self.bids.iter_mut() {
-            if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
-                let order = queue.remove(pos).unwrap();
-                if queue.is_empty() {
-                    let price_copy = *price;
-                    self.bids.remove(&price_copy);
-                    self.bid_depth.remove(&price_copy);
+    fn level_qty(&self, side: Side, price: Price) -> u64 {
+        self.levels(side)
+            .get(&price)
+            .map_or(0, |level| level.total_qty)
+    }
+
+    /// Quantity the order could trade right now, capped at the order's size.
+    fn executable_qty(&self, order: &Order) -> u64 {
+        fn sum<'a>(levels: impl Iterator<Item = (&'a Price, &'a Level)>, order: &Order) -> u64 {
+            let mut available = 0u64;
+            for (&price, level) in levels {
+                if available >= order.qty.value() || !order.accepts(price) {
+                    break;
                 }
-                return Some(order);
+                available = available.saturating_add(level.total_qty);
+            }
+            available.min(order.qty.value())
+        }
+
+        match order.side {
+            Side::Buy => sum(self.asks.iter(), order),
+            Side::Sell => sum(self.bids.iter().rev(), order),
+        }
+    }
+
+    /// Trades `taker` against the opposite side until it is filled or no
+    /// acceptable price remains. Decrements `taker.qty` as it fills.
+    fn match_against_book(&mut self, taker: &mut Order) -> Vec<Fill> {
+        let mut fills = Vec::new();
+
+        while !taker.qty.is_zero() {
+            let best = match taker.side {
+                Side::Buy => self.asks.first_entry(),
+                Side::Sell => self.bids.last_entry(),
+            };
+            let Some(mut entry) = best else { break };
+            let price = *entry.key();
+            if !taker.accepts(price) {
+                break;
+            }
+
+            let level = entry.get_mut();
+            while !taker.qty.is_zero() {
+                let Some(maker) = level.orders.front_mut() else {
+                    break;
+                };
+                let qty = taker.qty.value().min(maker.qty.value());
+                taker.qty = Quantity::new(taker.qty.value() - qty);
+                maker.qty = Quantity::new(maker.qty.value() - qty);
+                level.total_qty -= qty;
+                fills.push(Fill {
+                    taker_order_id: taker.id,
+                    maker_order_id: maker.id,
+                    taker_side: taker.side,
+                    price,
+                    qty: Quantity::new(qty),
+                    timestamp: taker.timestamp,
+                });
+                if maker.qty.is_zero() {
+                    if let Some(filled) = level.orders.pop_front() {
+                        self.index.remove(&filled.id);
+                    }
+                }
+            }
+
+            if level.orders.is_empty() {
+                entry.remove();
             }
         }
 
-        // Search in asks
-        for (price, queue) in self.asks.iter_mut() {
-            if let Some(pos) = queue.iter().position(|o| o.id == order_id) {
-                let order = queue.remove(pos).unwrap();
-                if queue.is_empty() {
-                    let price_copy = *price;
-                    self.asks.remove(&price_copy);
-                    self.ask_depth.remove(&price_copy);
-                }
-                return Some(order);
-            }
-        }
+        fills
+    }
 
-        None
+    /// Appends `order` to the back of the queue at `price`.
+    fn rest(&mut self, order: Order, price: Price) {
+        let levels = match order.side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let level = levels.entry(price).or_default();
+        // Cannot overflow: `validate` checked this level's total against the
+        // full order quantity, and matching only touches the opposite side.
+        level.total_qty += order.qty.value();
+        self.index.insert(order.id, (order.side, price));
+        level.orders.push_back(order);
     }
 }
 
@@ -407,217 +485,418 @@ impl OrderBook {
 mod tests {
     use super::*;
 
-    fn create_test_order(id: u64, side: Side, price: f64, qty: u64) -> Order {
-        Order::new(
-            OrderId::new(id),
-            side,
-            Price::from_f64(price),
-            Quantity::new(qty),
-            Timestamp::now_nanos(),
-        )
+    fn px(price: f64) -> Price {
+        Price::from_f64(price)
+    }
+
+    fn limit(id: u64, side: Side, price: f64, qty: u64) -> Order {
+        Order::limit(OrderId(id), side, px(price), Quantity(qty), Timestamp(id))
+    }
+
+    /// Submits a valid order and checks the book's invariants afterwards.
+    fn submit(book: &mut OrderBook, order: Order) -> SubmitResult {
+        let result = book.submit_order(order).expect("order should be valid");
+        book.check_invariants().expect("invariants should hold");
+        result
+    }
+
+    /// (taker id, maker id, price, qty) for each fill.
+    fn trades(result: &SubmitResult) -> Vec<(u64, u64, Price, u64)> {
+        result
+            .fills
+            .iter()
+            .map(|f| (f.taker_order_id.0, f.maker_order_id.0, f.price, f.qty.0))
+            .collect()
+    }
+
+    fn book() -> OrderBook {
+        OrderBook::new("TEST".to_string())
     }
 
     #[test]
-    fn test_empty_book() {
-        let book = OrderBook::new("TEST".to_string());
+    fn empty_book_has_no_prices() {
+        let book = book();
         assert_eq!(book.best_bid(), None);
         assert_eq!(book.best_ask(), None);
         assert_eq!(book.mid(), None);
+        assert_eq!(book.spread(), None);
+        assert!(book.is_empty());
     }
 
     #[test]
-    fn test_insert_single_bid() {
-        let mut book = OrderBook::new("TEST".to_string());
-        let order = create_test_order(1, Side::Buy, 100.0, 10);
-        let fills = book.insert_order(order);
-        assert!(fills.is_empty());
-        assert_eq!(book.best_bid(), Some(Price::from_f64(100.0)));
+    fn non_crossing_limit_orders_rest() {
+        let mut book = book();
+        let bid = submit(&mut book, limit(1, Side::Buy, 99.0, 10));
+        assert!(bid.fills.is_empty());
+        assert_eq!(
+            bid.outcome,
+            OrderOutcome::Resting {
+                remaining: Quantity(10)
+            }
+        );
+        submit(&mut book, limit(2, Side::Sell, 101.0, 5));
+
+        assert_eq!(book.best_bid(), Some(px(99.0)));
+        assert_eq!(book.best_ask(), Some(px(101.0)));
+        assert_eq!(book.bid_qty_at(px(99.0)), Quantity(10));
+        assert_eq!(book.ask_qty_at(px(101.0)), Quantity(5));
+        assert_eq!(book.order_count(), 2);
+        assert_eq!(
+            book.resting_order(OrderId(1)).map(|o| o.qty),
+            Some(Quantity(10))
+        );
+    }
+
+    #[test]
+    fn crossing_order_trades_at_the_resting_price() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        let result = submit(&mut book, limit(2, Side::Buy, 105.0, 5));
+
+        assert_eq!(trades(&result), vec![(2, 1, px(100.0), 5)]);
+        assert_eq!(result.fills[0].taker_side, Side::Buy);
+        assert_eq!(result.filled_qty, Quantity(5));
+        assert_eq!(result.outcome, OrderOutcome::Filled);
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn best_price_level_fills_first() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 101.0, 10));
+        submit(&mut book, limit(2, Side::Sell, 100.0, 10));
+        submit(&mut book, limit(3, Side::Sell, 102.0, 10));
+
+        let result = submit(&mut book, limit(4, Side::Buy, 102.0, 25));
+        assert_eq!(
+            trades(&result),
+            vec![
+                (4, 2, px(100.0), 10),
+                (4, 1, px(101.0), 10),
+                (4, 3, px(102.0), 5)
+            ]
+        );
+        assert_eq!(book.ask_levels(10), vec![(px(102.0), Quantity(5))]);
+    }
+
+    #[test]
+    fn earlier_orders_fill_first_and_partial_fills_keep_priority() {
+        let mut book = book();
+        for id in 1..=3 {
+            submit(&mut book, limit(id, Side::Sell, 100.0, 10));
+        }
+
+        let first = submit(&mut book, limit(4, Side::Buy, 100.0, 15));
+        assert_eq!(
+            trades(&first),
+            vec![(4, 1, px(100.0), 10), (4, 2, px(100.0), 5)]
+        );
+
+        // Order 2 was partially filled but is still ahead of order 3.
+        let second = submit(&mut book, limit(5, Side::Buy, 100.0, 6));
+        assert_eq!(
+            trades(&second),
+            vec![(5, 2, px(100.0), 5), (5, 3, px(100.0), 1)]
+        );
+        assert_eq!(book.ask_qty_at(px(100.0)), Quantity(9));
+    }
+
+    #[test]
+    fn gtc_remainder_rests_after_partial_fill() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 4));
+        let result = submit(&mut book, limit(2, Side::Buy, 101.0, 10));
+
+        assert_eq!(trades(&result), vec![(2, 1, px(100.0), 4)]);
+        assert_eq!(
+            result.outcome,
+            OrderOutcome::Resting {
+                remaining: Quantity(6)
+            }
+        );
+        assert_eq!(book.best_bid(), Some(px(101.0)));
+        assert_eq!(book.bid_qty_at(px(101.0)), Quantity(6));
         assert_eq!(book.best_ask(), None);
     }
 
     #[test]
-    fn test_insert_single_ask() {
-        let mut book = OrderBook::new("TEST".to_string());
-        let order = create_test_order(1, Side::Sell, 101.0, 10);
-        let fills = book.insert_order(order);
-        assert!(fills.is_empty());
-        assert_eq!(book.best_ask(), Some(Price::from_f64(101.0)));
-        assert_eq!(book.best_bid(), None);
+    fn ioc_takes_all_eligible_liquidity_then_cancels_the_rest() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(3, Side::Sell, 101.0, 5));
+        submit(&mut book, limit(4, Side::Sell, 102.0, 5));
+
+        let ioc = limit(5, Side::Buy, 101.0, 20).with_tif(TimeInForce::IOC);
+        let result = submit(&mut book, ioc);
+
+        assert_eq!(
+            trades(&result),
+            vec![
+                (5, 1, px(100.0), 5),
+                (5, 2, px(100.0), 5),
+                (5, 3, px(101.0), 5)
+            ]
+        );
+        assert_eq!(
+            result.outcome,
+            OrderOutcome::Cancelled {
+                remaining: Quantity(5)
+            }
+        );
+        assert_eq!(book.best_bid(), None, "IOC remainder must not rest");
+        assert_eq!(book.ask_levels(10), vec![(px(102.0), Quantity(5))]);
     }
 
     #[test]
-    fn test_marketable_buy_full_fill() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add resting sell order
-        let sell_order = create_test_order(1, Side::Sell, 100.0, 10);
-        book.insert_order(sell_order);
+    fn fok_that_cannot_fill_leaves_the_book_unchanged() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Sell, 101.0, 5));
+        let before = book.ask_levels(10);
 
-        // Aggressive buy order at same price
-        let buy_order = create_test_order(2, Side::Buy, 100.0, 10);
-        let fills = book.insert_order(buy_order);
+        let fok = limit(3, Side::Buy, 101.0, 11).with_tif(TimeInForce::FOK);
+        let result = submit(&mut book, fok);
 
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_qty, Quantity::new(10));
-        assert_eq!(fills[0].fill_price, Price::from_f64(100.0));
-        assert_eq!(fills[0].order_id, OrderId::new(2));
-
-        // Book should be empty
-        assert_eq!(book.best_bid(), None);
-        assert_eq!(book.best_ask(), None);
+        assert!(result.fills.is_empty());
+        assert_eq!(result.filled_qty, Quantity::ZERO);
+        assert_eq!(result.outcome, OrderOutcome::Killed);
+        assert_eq!(book.ask_levels(10), before);
+        assert_eq!(book.order_count(), 2);
     }
 
     #[test]
-    fn test_marketable_sell_full_fill() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add resting buy order
-        let buy_order = create_test_order(1, Side::Buy, 100.0, 10);
-        book.insert_order(buy_order);
+    fn fok_fills_across_levels_when_liquidity_suffices() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Sell, 101.0, 5));
 
-        // Aggressive sell order at same price
-        let sell_order = create_test_order(2, Side::Sell, 100.0, 10);
-        let fills = book.insert_order(sell_order);
+        let fok = limit(3, Side::Buy, 101.0, 10).with_tif(TimeInForce::FOK);
+        let result = submit(&mut book, fok);
 
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_qty, Quantity::new(10));
-        assert_eq!(fills[0].fill_price, Price::from_f64(100.0));
-
-        // Book should be empty
-        assert_eq!(book.best_bid(), None);
-        assert_eq!(book.best_ask(), None);
+        assert_eq!(result.outcome, OrderOutcome::Filled);
+        assert_eq!(result.filled_qty, Quantity(10));
+        assert!(book.is_empty());
     }
 
     #[test]
-    fn test_partial_fill() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add resting sell order for 10
-        let sell_order = create_test_order(1, Side::Sell, 100.0, 10);
-        book.insert_order(sell_order);
+    fn fok_ignores_liquidity_beyond_its_limit() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Sell, 102.0, 10));
 
-        // Aggressive buy order for 5 (partial)
-        let buy_order = create_test_order(2, Side::Buy, 100.0, 5);
-        let fills = book.insert_order(buy_order);
+        let fok = limit(3, Side::Buy, 101.0, 10).with_tif(TimeInForce::FOK);
+        let result = submit(&mut book, fok);
 
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_qty, Quantity::new(5));
-
-        // Book should have 5 remaining on sell side
-        assert_eq!(book.best_ask(), Some(Price::from_f64(100.0)));
-        assert_eq!(book.ask_qty_at(Price::from_f64(100.0)), Quantity::new(5));
+        assert_eq!(result.outcome, OrderOutcome::Killed);
+        assert_eq!(book.ask_qty_at(px(100.0)), Quantity(5));
     }
 
     #[test]
-    fn test_price_time_priority() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add two sell orders at same price
-        let sell1 = create_test_order(1, Side::Sell, 100.0, 10);
-        book.insert_order(sell1);
+    fn market_order_sweeps_and_cancels_remainder() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Sell, 150.0, 5));
 
-        std::thread::sleep(std::time::Duration::from_nanos(100));
-
-        let sell2 = create_test_order(2, Side::Sell, 100.0, 10);
-        book.insert_order(sell2);
-
-        // Aggressive buy should match first order first
-        let buy = create_test_order(3, Side::Buy, 100.0, 15);
-        let fills = book.insert_order(buy);
-
-        // Should get one fill that consumed full first order + partial second
-        assert!(!fills.is_empty());
-        let total_filled: u64 = fills.iter().map(|f| f.fill_qty.0).sum();
-        assert_eq!(total_filled, 15);
+        let result = submit(
+            &mut book,
+            Order::market(OrderId(3), Side::Buy, Quantity(20), Timestamp(3)),
+        );
+        assert_eq!(
+            trades(&result),
+            vec![(3, 1, px(100.0), 5), (3, 2, px(150.0), 5)]
+        );
+        assert_eq!(
+            result.outcome,
+            OrderOutcome::Cancelled {
+                remaining: Quantity(10)
+            }
+        );
+        assert!(book.is_empty());
     }
 
     #[test]
-    fn test_price_priority() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add sells at different prices
-        book.insert_order(create_test_order(1, Side::Sell, 101.0, 10));
-        book.insert_order(create_test_order(2, Side::Sell, 100.0, 10));
-        book.insert_order(create_test_order(3, Side::Sell, 102.0, 10));
+    fn market_sell_trades_against_bids_best_first() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 98.0, 5));
+        submit(&mut book, limit(2, Side::Buy, 99.0, 5));
 
-        // Best ask should be lowest price
-        assert_eq!(book.best_ask(), Some(Price::from_f64(100.0)));
-
-        // Aggressive buy at 105 should match 100 first
-        let buy = create_test_order(4, Side::Buy, 105.0, 5);
-        let fills = book.insert_order(buy);
-
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_price, Price::from_f64(100.0));
+        let result = submit(
+            &mut book,
+            Order::market(OrderId(3), Side::Sell, Quantity(7), Timestamp(3)),
+        );
+        assert_eq!(
+            trades(&result),
+            vec![(3, 2, px(99.0), 5), (3, 1, px(98.0), 2)]
+        );
+        assert_eq!(result.outcome, OrderOutcome::Filled);
+        assert_eq!(book.bid_levels(10), vec![(px(98.0), Quantity(3))]);
     }
 
     #[test]
-    fn test_limit_price_not_crossed() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add sell at 101
-        book.insert_order(create_test_order(1, Side::Sell, 101.0, 10));
+    fn invalid_orders_are_rejected_without_side_effects() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        let before = book.ask_levels(10);
 
-        // Buy limit at 100 should NOT match
-        let buy = create_test_order(2, Side::Buy, 100.0, 10);
-        let fills = book.insert_order(buy);
+        assert_eq!(
+            book.submit_order(limit(2, Side::Buy, 100.0, 0)),
+            Err(OrderError::ZeroQuantity)
+        );
+        assert_eq!(
+            book.submit_order(Order::limit(
+                OrderId(3),
+                Side::Buy,
+                Price(0),
+                Quantity(1),
+                Timestamp(3)
+            )),
+            Err(OrderError::NonPositivePrice(0))
+        );
+        assert_eq!(
+            book.submit_order(Order::limit(
+                OrderId(4),
+                Side::Buy,
+                Price(-5),
+                Quantity(1),
+                Timestamp(4)
+            )),
+            Err(OrderError::NonPositivePrice(-5))
+        );
+        assert_eq!(
+            book.submit_order(
+                Order::market(OrderId(5), Side::Buy, Quantity(1), Timestamp(5))
+                    .with_tif(TimeInForce::GTC)
+            ),
+            Err(OrderError::MarketOrderCannotRest)
+        );
+        assert_eq!(
+            book.submit_order(limit(1, Side::Sell, 101.0, 5)),
+            Err(OrderError::DuplicateOrderId(1))
+        );
+        assert_eq!(
+            book.submit_order(limit(1, Side::Buy, 100.0, 5).with_tif(TimeInForce::IOC)),
+            Err(OrderError::DuplicateOrderId(1)),
+            "a duplicate id must not trade either"
+        );
 
-        assert!(fills.is_empty());
-        assert_eq!(book.best_bid(), Some(Price::from_f64(100.0)));
-        assert_eq!(book.best_ask(), Some(Price::from_f64(101.0)));
+        assert_eq!(book.ask_levels(10), before);
+        assert_eq!(book.order_count(), 1);
+        book.check_invariants().unwrap();
     }
 
     #[test]
-    fn test_mid_and_spread() {
-        let mut book = OrderBook::new("TEST".to_string());
-        book.insert_order(create_test_order(1, Side::Buy, 99.0, 10));
-        book.insert_order(create_test_order(2, Side::Sell, 101.0, 10));
+    fn id_of_a_filled_order_can_be_reused() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Buy, 100.0, 5));
+        assert!(!book.contains_order(OrderId(1)));
 
-        assert_eq!(book.mid(), Some(Price::from_f64(100.0)));
-        assert_eq!(book.spread(), Some(Price::from_f64(2.0)));
+        let reused = submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        assert_eq!(
+            reused.outcome,
+            OrderOutcome::Resting {
+                remaining: Quantity(5)
+            }
+        );
     }
 
     #[test]
-    fn test_cancel_order() {
-        let mut book = OrderBook::new("TEST".to_string());
-        let order = create_test_order(1, Side::Buy, 100.0, 10);
-        book.insert_order(order);
+    fn level_quantity_overflow_is_rejected() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 100.0, u64::MAX - 1));
 
-        assert_eq!(book.best_bid(), Some(Price::from_f64(100.0)));
-
-        let cancelled = book.cancel_order(OrderId::new(1));
-        assert!(cancelled.is_some());
-        assert_eq!(book.best_bid(), None);
+        assert_eq!(
+            book.submit_order(limit(2, Side::Buy, 100.0, 2)),
+            Err(OrderError::LevelQuantityOverflow)
+        );
+        submit(&mut book, limit(3, Side::Buy, 100.0, 1));
+        assert_eq!(book.bid_qty_at(px(100.0)), Quantity(u64::MAX));
     }
 
     #[test]
-    fn test_ioc_order_partial_fill() {
-        let mut book = OrderBook::new("TEST".to_string());
-        // Add sell for 5
-        book.insert_order(create_test_order(1, Side::Sell, 100.0, 5));
+    fn cancel_updates_depth_and_removes_empty_levels() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 100.0, 10));
+        submit(&mut book, limit(2, Side::Buy, 100.0, 7));
+        submit(&mut book, limit(3, Side::Buy, 99.0, 5));
 
-        // IOC buy for 10 should only fill 5 and cancel rest
-        let mut buy = create_test_order(2, Side::Buy, 100.0, 10);
-        buy.tif = TimeInForce::IOC;
-        let fills = book.insert_order(buy);
+        let cancelled = book.cancel_order(OrderId(1)).expect("order 1 rests");
+        assert_eq!(cancelled.qty, Quantity(10));
+        assert_eq!(book.bid_qty_at(px(100.0)), Quantity(7));
+        assert_eq!(book.bid_levels(1), vec![(px(100.0), Quantity(7))]);
+        book.check_invariants().unwrap();
 
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].fill_qty, Quantity::new(5));
+        assert!(book.cancel_order(OrderId(2)).is_some());
+        assert_eq!(book.best_bid(), Some(px(99.0)));
+        assert_eq!(book.bid_qty_at(px(100.0)), Quantity::ZERO);
+        book.check_invariants().unwrap();
 
-        // No residual on bid side
-        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.cancel_order(OrderId(2)), None, "already cancelled");
+        assert_eq!(book.cancel_order(OrderId(999)), None, "never existed");
+        assert_eq!(book.order_count(), 1);
     }
 
     #[test]
-    fn test_levels_display() {
-        let mut book = OrderBook::new("TEST".to_string());
-        book.insert_order(create_test_order(1, Side::Buy, 99.0, 10));
-        book.insert_order(create_test_order(2, Side::Buy, 98.0, 20));
-        book.insert_order(create_test_order(3, Side::Sell, 101.0, 15));
-        book.insert_order(create_test_order(4, Side::Sell, 102.0, 25));
+    fn cancel_returns_remaining_quantity_after_partial_fill() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 10));
+        submit(&mut book, limit(2, Side::Buy, 100.0, 4));
 
-        let bids = book.bid_levels(2);
-        assert_eq!(bids.len(), 2);
-        assert_eq!(bids[0].0, Price::from_f64(99.0));
-        assert_eq!(bids[1].0, Price::from_f64(98.0));
+        let cancelled = book.cancel_order(OrderId(1)).expect("order 1 rests");
+        assert_eq!(cancelled.qty, Quantity(6));
+        assert!(book.is_empty());
+        book.check_invariants().unwrap();
+    }
 
-        let asks = book.ask_levels(2);
-        assert_eq!(asks.len(), 2);
-        assert_eq!(asks[0].0, Price::from_f64(101.0));
-        assert_eq!(asks[1].0, Price::from_f64(102.0));
+    #[test]
+    fn filled_orders_cannot_be_cancelled() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Sell, 100.0, 5));
+        submit(&mut book, limit(2, Side::Buy, 100.0, 5));
+        assert_eq!(book.cancel_order(OrderId(1)), None);
+    }
+
+    #[test]
+    fn mid_and_spread() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 99.0, 10));
+        submit(&mut book, limit(2, Side::Sell, 101.0, 10));
+        assert_eq!(book.mid(), Some(px(100.0)));
+        assert_eq!(book.spread(), Some(px(2.0)));
+
+        let mut odd = OrderBook::new("ODD".to_string());
+        submit(
+            &mut odd,
+            Order::limit(OrderId(1), Side::Buy, Price(100), Quantity(1), Timestamp(1)),
+        );
+        submit(
+            &mut odd,
+            Order::limit(
+                OrderId(2),
+                Side::Sell,
+                Price(103),
+                Quantity(1),
+                Timestamp(2),
+            ),
+        );
+        assert_eq!(odd.mid(), Some(Price(101)), "mid rounds down to a tick");
+        assert_eq!(odd.spread(), Some(Price(3)));
+    }
+
+    #[test]
+    fn depth_snapshots_are_best_first_and_aggregated() {
+        let mut book = book();
+        submit(&mut book, limit(1, Side::Buy, 99.0, 10));
+        submit(&mut book, limit(2, Side::Buy, 98.0, 20));
+        submit(&mut book, limit(3, Side::Buy, 99.0, 1));
+        submit(&mut book, limit(4, Side::Sell, 101.0, 15));
+        submit(&mut book, limit(5, Side::Sell, 102.0, 25));
+
+        assert_eq!(
+            book.bid_levels(5),
+            vec![(px(99.0), Quantity(11)), (px(98.0), Quantity(20))]
+        );
+        assert_eq!(book.ask_levels(1), vec![(px(101.0), Quantity(15))]);
     }
 }

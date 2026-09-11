@@ -3100,6 +3100,8 @@ name = "orderbook"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "proptest",
+ "rand 0.8.5",
  "serde",
  "thiserror 2.0.17",
 ]

@@ -2,7 +2,7 @@ use crate::risk::{RiskChecker, RiskConfig};
 use crate::state::{ChildOrderInfo, EngineState};
 use algo_core::twap::{compute_twap_schedule, TwapParams};
 use api::{EngineCommand, ParentOrder, ParentOrderStatus};
-use orderbook::{Fill, Order, OrderBook, Price, Quantity, Side, Timestamp};
+use orderbook::{Fill, Order, OrderBook, OrderId, Price, Quantity, Side, Timestamp};
 use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, Duration};
@@ -198,30 +198,37 @@ impl ExecutionEngine {
 
                 // Execute order against the correct orderbook for this symbol
                 let orderbook = self.get_or_create_orderbook(&symbol);
-                let fills = orderbook.insert_order(order.clone());
+                let fills = match orderbook.submit_order(order) {
+                    Ok(result) => result.fills,
+                    Err(e) => {
+                        error!("Child order {} rejected by the book: {}", order.id, e);
+                        // Don't increment i, we removed an element
+                        continue;
+                    }
+                };
 
-                // Process fills
+                // Process fills (the child order is the taker)
                 for fill in fills {
                     info!(
                         "Fill: order={} qty={} price={} time={}",
-                        fill.order_id, fill.fill_qty, fill.fill_price, fill.timestamp
+                        fill.taker_order_id, fill.qty, fill.price, fill.timestamp
                     );
 
                     // Update position
                     self.state.update_position(&symbol, &fill, order.side);
 
                     // Update child order status
-                    if let Some(child_info) = self.state.get_child_order_mut(&fill.order_id) {
-                        child_info.filled_qty = child_info.filled_qty.saturating_add(fill.fill_qty);
+                    if let Some(child_info) = self.state.get_child_order_mut(&fill.taker_order_id) {
+                        child_info.filled_qty = child_info.filled_qty.saturating_add(fill.qty);
                         child_info.status = "FILLED".to_string();
                     }
 
                     // Update parent order filled quantity
                     // Find parent ID from child order
-                    if let Some(child_info) = self.state.get_child_order(&fill.order_id) {
+                    if let Some(child_info) = self.state.get_child_order(&fill.taker_order_id) {
                         if let Some(parent) = self.state.get_parent_order_mut(child_info.parent_id)
                         {
-                            parent.filled_qty = parent.filled_qty.saturating_add(fill.fill_qty);
+                            parent.filled_qty = parent.filled_qty.saturating_add(fill.qty);
 
                             // Update parent status
                             if parent.filled_qty >= parent.total_qty {
@@ -233,7 +240,7 @@ impl ExecutionEngine {
                         }
                     }
 
-                    let _ = self.fill_tx.send(fill.clone());
+                    let _ = self.fill_tx.send(fill);
                     self.state.add_fill(fill);
                 }
 
@@ -320,7 +327,7 @@ impl ExecutionEngine {
                 "Seeding orderbook {} with market maker liquidity at price {}",
                 symbol, mid_price.0
             );
-            orderbook.seed_market_maker(mid_price, 10, Quantity::new(10000));
+            seed_liquidity(orderbook, mid_price, 10, Quantity::new(10000));
         }
 
         // For market orders, use aggressive pricing to cross the spread
@@ -350,7 +357,7 @@ impl ExecutionEngine {
 
         for instr in schedule {
             let child_id = self.state.next_child_id();
-            let order = Order::new(
+            let order = Order::limit(
                 child_id,
                 side,
                 price,
@@ -380,6 +387,31 @@ impl ExecutionEngine {
         self.state.add_parent_order(parent);
 
         info!("Parent order {} accepted and working", parent_id);
+    }
+}
+
+/// Order ids at or above this value are reserved for seeded liquidity.
+const SEED_ORDER_ID_BASE: u64 = 9_000_000_000_000_000_000;
+
+/// Rests `levels` bid and ask levels around `mid`, one basis point apart.
+fn seed_liquidity(book: &mut OrderBook, mid: Price, levels: u64, qty: Quantity) {
+    let step = (mid.ticks() / 10_000).max(1);
+    for level in 1..=levels {
+        let offset = step * level as i64;
+        let quotes = [
+            (Side::Sell, mid.ticks() + offset),
+            (Side::Buy, mid.ticks() - offset),
+        ];
+        for (slot, (side, ticks)) in quotes.into_iter().enumerate() {
+            let id = OrderId::new(SEED_ORDER_ID_BASE + level * 2 + slot as u64);
+            let order = Order::limit(id, side, Price::new(ticks), qty, Timestamp::now_nanos());
+            if let Err(e) = book.submit_order(order) {
+                error!(
+                    "Failed to seed {} liquidity at {} ticks: {}",
+                    side, ticks, e
+                );
+            }
+        }
     }
 }
 

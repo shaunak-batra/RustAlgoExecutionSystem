@@ -100,8 +100,8 @@ impl EngineState {
                 unrealized_pnl: 0.0,
             });
 
-        let fill_qty = fill.fill_qty.value() as i64;
-        let fill_price = fill.fill_price.as_f64();
+        let fill_qty = fill.qty.value() as i64;
+        let fill_price = fill.price.as_f64();
 
         match side {
             Side::Buy => {
@@ -208,33 +208,28 @@ mod tests {
     use super::*;
     use orderbook::{Price, Timestamp};
 
+    fn fill(taker: u64, side: Side, price: f64, qty: u64) -> Fill {
+        Fill {
+            taker_order_id: OrderId::new(taker),
+            maker_order_id: OrderId::new(0),
+            taker_side: side,
+            price: Price::from_f64(price),
+            qty: Quantity::new(qty),
+            timestamp: Timestamp::new(0),
+        }
+    }
+
     #[test]
     fn test_position_long_build() {
         let mut state = EngineState::new();
 
-        let fill1 = Fill {
-            order_id: OrderId::new(1),
-            fill_price: Price::from_f64(100.0),
-            fill_qty: Quantity::new(10),
-            timestamp: Timestamp::now_nanos(),
-            is_maker: false,
-        };
-
-        state.update_position("BTC", &fill1, Side::Buy);
+        state.update_position("BTC", &fill(1, Side::Buy, 100.0, 10), Side::Buy);
         let pos = state.get_position("BTC").unwrap();
         assert_eq!(pos.quantity, 10);
         assert!((pos.avg_price - 100.0).abs() < 0.01);
 
         // Add more at different price
-        let fill2 = Fill {
-            order_id: OrderId::new(2),
-            fill_price: Price::from_f64(105.0),
-            fill_qty: Quantity::new(10),
-            timestamp: Timestamp::now_nanos(),
-            is_maker: false,
-        };
-
-        state.update_position("BTC", &fill2, Side::Buy);
+        state.update_position("BTC", &fill(2, Side::Buy, 105.0, 10), Side::Buy);
         let pos = state.get_position("BTC").unwrap();
         assert_eq!(pos.quantity, 20);
         assert!((pos.avg_price - 102.5).abs() < 0.01); // (100*10 + 105*10) / 20
@@ -245,24 +240,10 @@ mod tests {
         let mut state = EngineState::new();
 
         // Buy 10 at 100
-        let fill1 = Fill {
-            order_id: OrderId::new(1),
-            fill_price: Price::from_f64(100.0),
-            fill_qty: Quantity::new(10),
-            timestamp: Timestamp::now_nanos(),
-            is_maker: false,
-        };
-        state.update_position("BTC", &fill1, Side::Buy);
+        state.update_position("BTC", &fill(1, Side::Buy, 100.0, 10), Side::Buy);
 
         // Sell 10 at 110
-        let fill2 = Fill {
-            order_id: OrderId::new(2),
-            fill_price: Price::from_f64(110.0),
-            fill_qty: Quantity::new(10),
-            timestamp: Timestamp::now_nanos(),
-            is_maker: false,
-        };
-        state.update_position("BTC", &fill2, Side::Sell);
+        state.update_position("BTC", &fill(2, Side::Sell, 110.0, 10), Side::Sell);
 
         let pos = state.get_position("BTC").unwrap();
         assert_eq!(pos.quantity, 0);
