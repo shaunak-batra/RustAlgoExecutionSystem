@@ -86,11 +86,19 @@ pub(crate) fn slice_start(start_ns: u64, duration_ns: u64, num_slices: usize, in
 ///
 /// `cumulative[k]` is the fraction of `total` that should be complete after
 /// slice `k`; it should be non-decreasing and within `[0, 1]`. Each cumulative
-/// target is rounded to the nearest unit and the last slice always completes
-/// `total`, so the quantities sum exactly to `total` and, for totals below
-/// 2^53, every prefix of the schedule is within half a unit of the ideal curve.
+/// target is rounded to the nearest unit (ties away from zero) and the last
+/// slice always completes `total`, so the quantities sum exactly to `total`.
+///
 /// Rounding the running total, rather than each slice independently, is what
-/// keeps the error from accumulating.
+/// keeps the error from accumulating: prefix `k` lands within half a unit of
+/// `total as f64 * cumulative[k]`, plus the error of evaluating that product,
+/// which is nothing for totals below 2^53 and at most an ulp of `total` above
+/// it. Measured against an exact rational curve, add whatever error the
+/// caller's own `cumulative` values already carry — for a profile summed in
+/// `f64` that grows with the number of slices.
+///
+/// Targets are also clamped to the running total, so a curve that dips gives
+/// that slice zero rather than a negative quantity.
 pub fn quantities_from_cumulative(total: u64, cumulative: &[f64]) -> Vec<u64> {
     let mut quantities = Vec::with_capacity(cumulative.len());
     let mut done = 0u64;
@@ -167,6 +175,23 @@ mod tests {
     }
 
     #[test]
+    fn a_dipping_curve_gives_zero_instead_of_a_negative_slice() {
+        // Clamping to the running total is what keeps this from underflowing.
+        assert_eq!(
+            quantities_from_cumulative(100, &[0.5, 0.3, 1.0]),
+            vec![50, 0, 50]
+        );
+    }
+
+    #[test]
+    fn exact_halves_round_away_from_zero() {
+        // 10 * 0.25 is exactly 2.5 and 6 * 0.75 exactly 4.5: ties go up, not to
+        // even, which is what makes the remainder land where TWAP puts it.
+        assert_eq!(quantities_from_cumulative(10, &[0.25, 1.0]), vec![3, 7]);
+        assert_eq!(quantities_from_cumulative(6, &[0.75, 1.0]), vec![5, 1]);
+    }
+
+    #[test]
     fn cumulative_rounding_handles_the_largest_totals() {
         let quantities = quantities_from_cumulative(u64::MAX, &[0.25, 0.5, 1.0]);
         let sum: u128 = quantities.iter().map(|&q| u128::from(q)).sum();
@@ -197,8 +222,12 @@ mod tests {
             for (k, &qty) in quantities.iter().enumerate() {
                 done += qty;
                 let ideal = total as f64 * cumulative[k];
-                prop_assert!((done as f64 - ideal).abs() <= 0.5 + 1e-9 * total as f64,
-                    "prefix {} is {} but the curve says {}", k, done, ideal);
+                // Half a unit, plus the rounding error of the product itself. The
+                // previous slack of 1e-9 * total allowed a prefix to be 1000 units
+                // off at the largest totals, which would have hidden a real bug.
+                let slack = 0.5 + 2.0 * f64::EPSILON * total as f64;
+                prop_assert!((done as f64 - ideal).abs() <= slack,
+                    "prefix {} is {} but the curve says {} (slack {})", k, done, ideal, slack);
                 if weights[k] == 0 {
                     prop_assert_eq!(qty, 0);
                 }

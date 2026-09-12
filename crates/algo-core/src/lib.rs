@@ -2,10 +2,11 @@
 //!
 //! Schedulers that split a parent order into child orders:
 //!
-//! - [`twap`]: equal quantities per time slice, optionally released at a
-//!   seeded random time inside each slice
+//! - [`twap`]: quantities per time slice that differ by at most one unit,
+//!   optionally released at a seeded random time inside each slice
 //! - [`vwap`]: quantities proportional to a historical intraday volume profile
-//! - [`pov`]: a fixed share of observed market volume, without look-ahead
+//! - [`pov`]: a fixed share of observed market volume, each child released at
+//!   the timestamp of the observation that allowed it
 //! - [`is`]: implementation shortfall via the Almgren–Chriss optimal trajectory
 //!
 //! Every scheduler validates its input and returns a [`ScheduleError`] rather

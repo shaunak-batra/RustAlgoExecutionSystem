@@ -28,8 +28,11 @@ pub struct VwapParams {
 ///
 /// The quantity complete after slice `k` is the profile's cumulative share
 /// times `total_qty`, rounded to the nearest unit, so the total is exact and
-/// every prefix stays within half a unit of the ideal curve (see
-/// [`quantities_from_cumulative`]). Slices with zero weight get no child order.
+/// each prefix tracks the ideal curve to within half a unit plus floating-point
+/// error (see [`quantities_from_cumulative`]; the cumulative shares are `f64`
+/// sums, so at very large `total_qty` that error grows with the number of
+/// slices). Slices with zero weight get no child order, and the order always
+/// completes on the last slice that has volume.
 ///
 /// # Examples
 /// ```
@@ -52,19 +55,18 @@ pub fn compute_vwap_schedule(
 
     // Dividing by the largest weight keeps the running sum finite for any finite input.
     let total_weight: f64 = volume_profile.iter().map(|w| w / largest).sum();
+    // The curve stops at the last slice that has volume, because
+    // quantities_from_cumulative always completes the total on its final entry.
+    // Truncating rather than forcing 1.0 from that slice onwards is what keeps a
+    // trailing zero-weight slice from collecting the remainder when rounding the
+    // f64 target cannot reach the total exactly (totals above 2^53).
     let last_slice_with_volume = volume_profile.iter().rposition(|&w| w > 0.0).unwrap_or(0);
     let mut running = 0.0;
-    let cumulative: Vec<f64> = volume_profile
+    let cumulative: Vec<f64> = volume_profile[..=last_slice_with_volume]
         .iter()
-        .enumerate()
-        .map(|(k, &w)| {
+        .map(|&w| {
             running += w / largest;
-            // The order must be complete by the last slice that has volume.
-            if k >= last_slice_with_volume {
-                1.0
-            } else {
-                running / total_weight
-            }
+            running / total_weight
         })
         .collect();
 
@@ -102,7 +104,8 @@ impl IntradayWindow {
 /// the bar. A bar belongs to the slice containing its time of day
 /// (`timestamp_ns % day_ns`); bars outside the window are ignored. Volume is
 /// pooled across all days and returned as each slice's fraction of the pooled
-/// window volume, so the fractions sum to 1 and busier days weigh more.
+/// window volume, so the fractions sum to 1 (up to floating-point rounding) and
+/// busier days weigh more.
 ///
 /// Pass only bars from before the day being traded: using that day's own
 /// volume would be look-ahead.
@@ -290,6 +293,66 @@ mod tests {
     }
 
     #[test]
+    fn the_order_completes_on_the_last_slice_with_volume() {
+        // Above 2^53 a rounded f64 target cannot land exactly on the total, so
+        // this is where a trailing zero-weight slice used to collect the
+        // remainder.
+        let total_qty = (1u64 << 53) + 12_345;
+        let schedule = compute_vwap_schedule(
+            VwapParams {
+                start_ns: 0,
+                end_ns: 4 * SECOND,
+                total_qty,
+            },
+            &[1.0, 1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        assert_eq!(schedule.len(), 2, "no child after the volume ends");
+        assert_eq!(schedule.iter().map(|c| c.qty).sum::<u64>(), total_qty);
+        assert_eq!(schedule[1].target_time_ns, SECOND);
+    }
+
+    #[test]
+    fn profile_from_bars_accepts_a_window_ending_exactly_at_midnight() {
+        let window = IntradayWindow {
+            start_offset_ns: 990,
+            duration_ns: 10,
+            day_ns: 1_000,
+        };
+        assert_eq!(
+            volume_profile_from_bars(&[(992, 4), (999, 1)], window, 2).unwrap(),
+            vec![0.8, 0.2]
+        );
+    }
+
+    #[test]
+    fn profile_from_bars_assigns_a_bar_on_a_boundary_to_the_later_slice() {
+        let window = IntradayWindow {
+            start_offset_ns: 0,
+            duration_ns: 10,
+            day_ns: 100,
+        };
+        // Slice 1 starts at offset 5, so the bar at 4 belongs to slice 0.
+        assert_eq!(
+            volume_profile_from_bars(&[(4, 3), (5, 1)], window, 2).unwrap(),
+            vec![0.75, 0.25]
+        );
+    }
+
+    #[test]
+    fn profile_from_bars_rejects_too_many_slices() {
+        let window = IntradayWindow {
+            start_offset_ns: 0,
+            duration_ns: u64::MAX / 2,
+            day_ns: u64::MAX,
+        };
+        assert!(matches!(
+            volume_profile_from_bars(&[(0, 1)], window, MAX_SLICES + 1),
+            Err(ScheduleError::TooManySlices { .. })
+        ));
+    }
+
+    #[test]
     fn profile_from_bars_validates_its_window() {
         let window = |start_offset_ns, duration_ns, day_ns| IntradayWindow {
             start_offset_ns,
@@ -340,8 +403,12 @@ mod tests {
                 }
                 running += weight;
                 let ideal = total_qty as f64 * running / weight_total;
-                prop_assert!((done as f64 - ideal).abs() <= 0.5 + 1e-9 * total_qty as f64,
-                    "after slice {}: {} done, ideal {}", k, done, ideal);
+                // Half a unit, plus the error of the profile's own f64 cumulative
+                // sums, which grows with the slice count. The previous slack of
+                // 1e-9 * total_qty allowed 1000 units and hid real violations.
+                let slack = 0.5 + 4.0 * profile.len() as f64 * f64::EPSILON * total_qty as f64;
+                prop_assert!((done as f64 - ideal).abs() <= slack,
+                    "after slice {}: {} done, ideal {} (slack {})", k, done, ideal, slack);
             }
         }
     }

@@ -17,8 +17,9 @@
 //!
 //! Minimising `E + λ·V` gives `x_j = X · sinh(κ(T − t_j)) / sinh(κT)` with
 //! `t_j = jτ` and `κ` solving `(2/τ²)(cosh(κτ) − 1) = λσ²/η̃`. With `λ = 0`
-//! (risk-neutral) this is TWAP; larger `λ` trades faster early to cut exposure
-//! to price moves, at a higher expected impact cost.
+//! (risk-neutral) `κ` is zero, the trajectory is linear, and the schedule is
+//! TWAP down to the same integer child quantities. Larger `λ` trades faster
+//! early to cut exposure to price moves, at a higher expected impact cost.
 //!
 //! The fixed per-share cost of crossing the spread (the paper's `ε`) is left
 //! out: it adds `ε·X` to the cost of every schedule that trades in one
@@ -45,7 +46,7 @@ pub struct AlmgrenChrissParams {
     pub end_ns: u64,
     pub total_qty: u64,
     pub num_slices: usize,
-    /// `λ ≥ 0`, in 1/currency. Zero gives TWAP.
+    /// `λ ≥ 0`, in 1/currency. Zero gives exactly TWAP; see the module docs.
     pub risk_aversion: f64,
     /// `σ ≥ 0`: price volatility, in price units per √second.
     pub volatility: f64,
@@ -71,7 +72,9 @@ pub struct AlmgrenChrissSchedule {
 }
 
 /// Computes the Almgren–Chriss optimal trajectory and rounds it into child
-/// orders, one per slice start, whose quantities sum exactly to `total_qty`.
+/// orders at slice starts, whose quantities sum exactly to `total_qty`. A slice
+/// whose rounded quantity is zero is omitted, so with high urgency, or with
+/// fewer units than slices, there are fewer children than slices.
 ///
 /// # Examples
 /// ```
@@ -109,8 +112,16 @@ pub fn compute_almgren_chriss_schedule(
     }
     holdings.push(0.0);
 
-    let cumulative: Vec<f64> = holdings[1..].iter().map(|&x| 1.0 - x / total).collect();
-    let children = quantities_from_cumulative(params.total_qty, &cumulative)
+    // κ = 0 is exactly the linear trajectory, so round it the way TWAP does.
+    // Rounding `1 − x/total` instead would agree mathematically but can fall on
+    // the wrong side of an exact half, giving quantities TWAP would not produce.
+    let quantities = if kappa == 0.0 {
+        crate::twap::twap_quantities(params.total_qty, n).collect()
+    } else {
+        let cumulative: Vec<f64> = holdings[1..].iter().map(|&x| 1.0 - x / total).collect();
+        quantities_from_cumulative(params.total_qty, &cumulative)
+    };
+    let children = quantities
         .into_iter()
         .enumerate()
         .filter(|&(_, qty)| qty > 0)
@@ -149,6 +160,12 @@ pub fn almgren_chriss_cost(
         return Err(ScheduleError::InvalidParameter {
             name: "holdings",
             reason: "must start at total_qty and end at zero",
+        });
+    }
+    if holdings.iter().any(|x| !x.is_finite()) {
+        return Err(ScheduleError::InvalidParameter {
+            name: "holdings",
+            reason: "must all be finite",
         });
     }
     Ok(model.cost(params, holdings))
@@ -203,7 +220,14 @@ impl Model {
         // κτ = acosh(1 + y) with y = κ̃²τ²/2, written as ln(1 + y + √(y(y+2)))
         // via ln_1p so it stays accurate when y is tiny.
         let y = 0.5 * kappa_tilde_sq * self.tau * self.tau;
-        let kappa = (y + (y * (y + 2.0)).sqrt()).ln_1p() / self.tau;
+        // √(y(y+2)): for large y the product would overflow even though κ is
+        // perfectly finite, so factor y out; below 1 the direct form is exact.
+        let root = if y > 1.0 {
+            y * (1.0 + 2.0 / y).sqrt()
+        } else {
+            (y * (y + 2.0)).sqrt()
+        };
+        let kappa = (y + root).ln_1p() / self.tau;
         if kappa.is_finite() {
             Ok(kappa)
         } else {
@@ -218,10 +242,15 @@ impl Model {
     fn cost(&self, params: &AlmgrenChrissParams, holdings: &[f64]) -> (f64, f64) {
         let total = params.total_qty as f64;
         let squared_trades: f64 = holdings.windows(2).map(|w| (w[0] - w[1]).powi(2)).sum();
-        let squared_holdings: f64 = holdings[1..].iter().map(|x| x * x).sum();
         let expected = 0.5 * params.permanent_impact * total * total
             + self.eta_tilde / self.tau * squared_trades;
-        let variance = params.volatility * params.volatility * self.tau * squared_holdings;
+        // Scaling each holding before squaring keeps a zero trajectory at zero
+        // variance. Computing σ² first would give inf · 0 = NaN for a huge σ.
+        let variance = self.tau
+            * holdings[1..]
+                .iter()
+                .map(|x| (params.volatility * x).powi(2))
+                .sum::<f64>();
         (expected, variance)
     }
 }
@@ -299,14 +328,31 @@ mod tests {
         for (x, expected) in schedule.holdings.iter().zip(linear_holdings()) {
             assert!((x - expected).abs() < 1e-6, "{x} vs {expected}");
         }
-        let twap = compute_twap_schedule(TwapParams {
-            start_ns: 0,
-            end_ns: HOUR_NS,
-            total_qty: TOTAL,
-            num_slices: SLICES,
-        })
-        .unwrap();
-        assert_eq!(schedule.children, twap);
+
+        // The children equal TWAP's for every size, not just sizes that divide
+        // evenly. Rounding the float trajectory instead agrees mathematically but
+        // lands on the wrong side of an exact half for sizes like 9 over 6.
+        for num_slices in 1..40 {
+            for total_qty in (1u64..200).chain([999, 1_000, 100_000, (1u64 << 53) + 7]) {
+                let p = AlmgrenChrissParams {
+                    total_qty,
+                    num_slices,
+                    ..params(0.0)
+                };
+                let is = compute_almgren_chriss_schedule(p).unwrap();
+                let twap = compute_twap_schedule(TwapParams {
+                    start_ns: p.start_ns,
+                    end_ns: p.end_ns,
+                    total_qty,
+                    num_slices,
+                })
+                .unwrap();
+                assert_eq!(
+                    is.children, twap,
+                    "{total_qty} units over {num_slices} slices"
+                );
+            }
+        }
     }
 
     #[test]
@@ -327,17 +373,23 @@ mod tests {
 
     #[test]
     fn holdings_match_the_textbook_sinh_formula() {
-        let schedule = compute_almgren_chriss_schedule(params(1e-3)).unwrap();
         let (tau, _) = tau_and_eta_tilde();
         let horizon = tau * SLICES as f64;
-        let kappa = schedule.kappa;
-        for (j, &x) in schedule.holdings.iter().enumerate() {
-            let t = tau * j as f64;
-            let expected = TOTAL as f64 * (kappa * (horizon - t)).sinh() / (kappa * horizon).sinh();
-            assert!(
-                (x - expected).abs() <= 1e-9 * TOTAL as f64,
-                "j = {j}: {x} vs {expected}"
-            );
+        // 1e-11 puts κT near 3e-4, where the curve is very nearly linear: close
+        // enough that a loose tolerance would accept a straight line, and far
+        // enough that this one does not.
+        for lambda in [1e-11, 1e-8, 1e-6, 1e-3, 1e-1] {
+            let schedule = compute_almgren_chriss_schedule(params(lambda)).unwrap();
+            let kappa = schedule.kappa;
+            for (j, &x) in schedule.holdings.iter().enumerate() {
+                let t = tau * j as f64;
+                let expected =
+                    TOTAL as f64 * (kappa * (horizon - t)).sinh() / (kappa * horizon).sinh();
+                assert!(
+                    (x - expected).abs() <= 1e-9 * TOTAL as f64,
+                    "lambda {lambda}, j = {j}: {x} vs {expected}"
+                );
+            }
         }
     }
 
@@ -437,6 +489,96 @@ mod tests {
     }
 
     #[test]
+    fn extreme_risk_aversion_stays_finite() {
+        // y = λσ²τ²/(2η̃) reaches 3.6e201 at λ = 1e200. Squaring it to form
+        // √(y(y+2)) would overflow and reject a κ that is really about 1.55, and
+        // at λ = 1e30 the horizon reaches κT ≈ 880, where evaluating the sinh
+        // ratio directly gives inf/inf = NaN.
+        for lambda in [1e30, 1e200] {
+            let schedule = compute_almgren_chriss_schedule(params(lambda)).unwrap();
+            assert!(
+                schedule.kappa.is_finite() && schedule.kappa > 0.0,
+                "lambda {lambda}: kappa {}",
+                schedule.kappa
+            );
+            assert!(schedule.holdings.iter().all(|x| x.is_finite()));
+            assert!(schedule.holdings.windows(2).all(|w| w[1] <= w[0]));
+            assert_eq!(schedule.children.iter().map(|c| c.qty).sum::<u64>(), TOTAL);
+            // At this urgency the whole order goes in the first slice.
+            assert_eq!(schedule.children[0].qty, TOTAL);
+        }
+    }
+
+    #[test]
+    fn tiny_risk_aversion_keeps_kappa_positive() {
+        // Here y is about 3.6e-19, so `1 + y` is exactly 1.0 in f64 and
+        // acosh(1 + y) would collapse κ to zero. Writing κτ as
+        // ln_1p(y + √(y(y+2))) keeps the √(2y) behaviour instead.
+        let schedule = compute_almgren_chriss_schedule(params(1e-20)).unwrap();
+        assert!(schedule.kappa > 0.0, "kappa {}", schedule.kappa);
+        assert!(schedule.kappa < 1e-9, "kappa {}", schedule.kappa);
+    }
+
+    #[test]
+    fn an_eta_tilde_of_exactly_zero_is_rejected() {
+        // τ = 2 s exactly, so η̃ = η − γτ/2 = 0.25 − 0.25 = 0 with no rounding.
+        // The model divides by η̃, so zero has to be rejected, not just negatives.
+        let p = AlmgrenChrissParams {
+            end_ns: 2_000_000_000,
+            num_slices: 1,
+            temporary_impact: 0.25,
+            permanent_impact: 0.25,
+            ..params(1e-3)
+        };
+        assert!(matches!(
+            compute_almgren_chriss_schedule(p),
+            Err(ScheduleError::InvalidParameter {
+                name: "temporary_impact",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn variance_is_zero_rather_than_nan_when_nothing_is_held() {
+        // σ² overflows to infinity, and one slice holds nothing after it trades,
+        // so forming σ² · τ · Σx² would give inf · 0 = NaN.
+        let p = AlmgrenChrissParams {
+            volatility: f64::MAX,
+            num_slices: 1,
+            ..params(0.0)
+        };
+        let schedule = compute_almgren_chriss_schedule(p).unwrap();
+        assert_eq!(schedule.cost_variance, 0.0);
+        assert!(schedule.expected_cost.is_finite());
+    }
+
+    #[test]
+    fn a_slightly_wrong_urgency_costs_more() {
+        // The trajectory is optimal in κ too, not only against arbitrary
+        // perturbations: rebuilding it with κ off by 5% is measurably worse.
+        let p = params(1e-3);
+        let optimal = compute_almgren_chriss_schedule(p).unwrap();
+        let best = objective(&p, &optimal.holdings);
+        let (tau, _) = tau_and_eta_tilde();
+        let horizon = tau * SLICES as f64;
+
+        for factor in [0.95, 1.05] {
+            let kappa = optimal.kappa * factor;
+            let holdings: Vec<f64> = (0..=SLICES)
+                .map(|j| {
+                    let t = tau * j as f64;
+                    TOTAL as f64 * (kappa * (horizon - t)).sinh() / (kappa * horizon).sinh()
+                })
+                .collect();
+            assert!(
+                objective(&p, &holdings) > best,
+                "kappa x {factor} should cost more than the optimum"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_parameters_are_rejected() {
         let rejects = |p: AlmgrenChrissParams, field: &str| {
             assert!(
@@ -501,12 +643,22 @@ mod tests {
         let mut not_liquidated = linear_holdings();
         not_liquidated[SLICES] = 1.0;
         assert!(almgren_chriss_cost(&p, &not_liquidated).is_err());
+
+        // Non-finite holdings would silently produce a NaN cost.
+        for bad in [f64::INFINITY, f64::NAN] {
+            let mut holdings = linear_holdings();
+            holdings[1] = bad;
+            assert!(almgren_chriss_cost(&p, &holdings).is_err(), "{bad}");
+        }
     }
 
     proptest! {
         #[test]
         fn holdings_minimise_expected_cost_plus_risk(
-            perturbation in prop::collection::vec(-2_000.0f64..2_000.0, SLICES - 1),
+            // Small perturbations. Large ones make the quadratic term dominate, so
+            // the objective rises whatever trajectory it started from, and the
+            // test would pass for a clearly non-optimal schedule.
+            perturbation in prop::collection::vec(-20.0f64..20.0, SLICES - 1),
         ) {
             let p = params(1e-3);
             let optimal = compute_almgren_chriss_schedule(p).unwrap().holdings;

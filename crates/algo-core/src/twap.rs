@@ -65,8 +65,9 @@ pub fn compute_twap_schedule(
 /// slice `k` is drawn uniformly from `[start of slice k, start of slice k + 1)`
 /// with SplitMix64 seeded by `seed`: the same seed gives the same schedule on
 /// every platform and Rust version, while an observer cannot predict release
-/// times from a fixed clock. One draw is made per slice, so slice `k`'s time
-/// depends only on the seed, the window, and `k`.
+/// times from a fixed clock. One draw is made per slice, including a slice whose
+/// quantity rounds to zero, so slice `k`'s release time depends only on the
+/// seed, the window, `num_slices` and `k` — never on `total_qty`.
 pub fn compute_twap_randomized(
     params: TwapParams,
     seed: u64,
@@ -98,7 +99,7 @@ pub fn compute_twap_randomized(
 /// Per-slice TWAP quantities (including zeros): the cumulative target
 /// `total · k / n` rounded to the nearest integer, computed as
 /// `q·k + round(r·k / n)` with `total = q·n + r` so nothing overflows.
-fn twap_quantities(total_qty: u64, num_slices: usize) -> impl Iterator<Item = u64> {
+pub(crate) fn twap_quantities(total_qty: u64, num_slices: usize) -> impl Iterator<Item = u64> {
     let n = num_slices as u128;
     let (quotient, remainder) = (u128::from(total_qty) / n, u128::from(total_qty) % n);
     let mut done = 0u128;
@@ -241,6 +242,38 @@ mod tests {
                 let from = 1_000 + 2_000 * k as u64;
                 assert!((from..from + 2_000).contains(&child.target_time_ns));
             }
+        }
+    }
+
+    #[test]
+    fn randomized_schedule_matches_pinned_values() {
+        // Pinned against an independent SplitMix64 implementation. The window is
+        // not divisible by the slice count (10_000 ns over 7), so slice lengths
+        // differ, and total_qty < num_slices, so some slices round to zero.
+        let schedule = compute_twap_randomized(params(1_000, 11_000, 5, 7), 42).unwrap();
+        let pairs: Vec<(u64, u64)> = schedule
+            .iter()
+            .map(|child| (child.target_time_ns, child.qty))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(2_058, 1), (4_254, 1), (5_776, 1), (6_768, 1), (9_883, 1)]
+        );
+    }
+
+    #[test]
+    fn slice_release_times_do_not_depend_on_the_quantity() {
+        // A slice that rounds to zero still consumes its draw, so the slices that
+        // do trade keep the times they would have had.
+        let p = |total_qty| params(1_000, 11_000, total_qty, 7);
+        let sparse = compute_twap_randomized(p(5), 42).unwrap();
+        let dense = compute_twap_randomized(p(100), 42).unwrap();
+        assert_eq!(quantities(&sparse), vec![1; 5]);
+        assert_eq!(quantities(&dense), vec![14, 15, 14, 14, 14, 15, 14]);
+
+        let dense_times = times(&dense);
+        for time in times(&sparse) {
+            assert!(dense_times.contains(&time), "slice time {time} moved");
         }
     }
 

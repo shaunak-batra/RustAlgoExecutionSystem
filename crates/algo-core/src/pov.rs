@@ -29,11 +29,21 @@ pub struct PovSchedule {
     pub shortfall_qty: u64,
 }
 
-/// Trades a fixed share of observed market volume, releasing a child order only
-/// after the volume it is based on has printed (no look-ahead).
+/// Trades a fixed share of observed market volume.
 ///
 /// `market_volume` holds `(timestamp_ns, volume)` observations in time order,
-/// where `volume` traded by `timestamp_ns`. After each observation in
+/// where `volume` is the volume that traded *since the observation before it*
+/// (an increment, not a running total) and `timestamp_ns` is when that volume
+/// became known — a bar's close, not its open.
+///
+/// Each child order is released at the timestamp of the observation that allowed
+/// it, so the schedule never reacts to an observation that appears later in the
+/// data. Note what that does and does not promise: release happens at the same
+/// instant as the print it reacts to, so passing timestamps that precede the
+/// information (bar opens, for instance) would be look-ahead no matter what this
+/// function does. Offset the timestamps if a strictly later release is wanted.
+///
+/// After each observation in
 /// `[start_ns, end_ns)` the cumulative target is
 /// `min(total_qty, ⌊cumulative volume × participation_bps / 10 000⌋)`, and a
 /// child order for any increase is released at that observation's timestamp.
@@ -223,21 +233,44 @@ mod tests {
 
     proptest! {
         #[test]
-        fn cap_completeness_and_causality(
+        fn cap_completeness_and_prefix_invariance(
             total_qty in 1u64..1_000_000_000,
             participation_bps in 1u32..=10_000,
-            volumes in prop::collection::vec(0u64..1_000_000_000, 0..60),
+            // Gaps of zero repeat a timestamp, and small volumes make increments
+            // that round to nothing. Both are cases the schedule has to handle.
+            observations in prop::collection::vec((0u64..3, 0u64..1_000_000_000), 0..60),
         ) {
-            let data: Vec<(u64, u64)> = volumes.iter().enumerate().map(|(i, &v)| (i as u64, v)).collect();
+            let mut timestamp = 0u64;
+            let data: Vec<(u64, u64)> = observations
+                .iter()
+                .map(|&(gap, volume)| {
+                    timestamp += gap;
+                    (timestamp, volume)
+                })
+                .collect();
             let p = PovParams { start_ns: 0, end_ns: 1_000, total_qty, participation_bps };
             let full = compute_pov_schedule(p, &data).unwrap();
+
+            // Every child is a real order: positive, inside the window, in strict
+            // time order, and the children account for scheduled_qty exactly.
+            prop_assert!(full.children.iter().all(|c| c.qty > 0));
+            prop_assert!(full.children.windows(2).all(|w| w[0].target_time_ns < w[1].target_time_ns));
+            prop_assert!(full.children.iter().all(|c| (p.start_ns..p.end_ns).contains(&c.target_time_ns)));
+            prop_assert_eq!(
+                full.children.iter().map(|c| u128::from(c.qty)).sum::<u128>(),
+                u128::from(full.scheduled_qty)
+            );
 
             // Cap: the schedule is never ahead of rate x cumulative volume.
             let mut cumulative_volume = 0u128;
             let mut done = 0u128;
             let mut children = full.children.iter().peekable();
-            for &(t, v) in &data {
+            for (i, &(t, v)) in data.iter().enumerate() {
                 cumulative_volume += u128::from(v);
+                // Observations sharing a timestamp are one decision point.
+                if data.get(i + 1).is_some_and(|&(next, _)| next == t) {
+                    continue;
+                }
                 if children.peek().is_some_and(|c| c.target_time_ns == t) {
                     done += u128::from(children.next().unwrap().qty);
                 }
@@ -250,13 +283,16 @@ mod tests {
             prop_assert_eq!(u128::from(full.scheduled_qty), allowed);
             prop_assert_eq!(full.scheduled_qty + full.shortfall_qty, total_qty);
 
-            // Causality: data that arrives later never changes earlier children.
+            // Prefix invariance: once every observation carrying a timestamp has
+            // been seen, that timestamp's child is settled and later data cannot
+            // change it.
             for cut in 0..=data.len() {
                 let prefix = compute_pov_schedule(p, &data[..cut]).unwrap();
-                let expected: Vec<_> = full.children.iter().copied()
-                    .filter(|c| c.target_time_ns < cut as u64)
-                    .collect();
-                prop_assert_eq!(prefix.children, expected);
+                let boundary = data.get(cut).map_or(u64::MAX, |&(t, _)| t);
+                let settled = |children: &[ChildOrderInstruction]| -> Vec<ChildOrderInstruction> {
+                    children.iter().copied().filter(|c| c.target_time_ns < boundary).collect()
+                };
+                prop_assert_eq!(settled(&prefix.children), settled(&full.children));
             }
         }
     }
