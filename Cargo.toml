@@ -5,9 +5,6 @@ members = [
     "crates/engine",
     "crates/api",
     "crates/config",
-    "crates/analytics",
-    "crates/indicators",
-    "crates/backtesting",
     "crates/python-bindings",
     "crates/trader-gui",
 ]

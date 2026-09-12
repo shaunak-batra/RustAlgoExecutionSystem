@@ -1,1015 +1,563 @@
-# 🚀 QuantSystem - Enterprise-Grade Algorithmic Trading Platform
+# Algorithmic execution engine
 
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-98%20passing-brightgreen.svg)](https://github.com/yourusername/QuantSystem)
-[![Build](https://img.shields.io/badge/build-passing-success.svg)](https://github.com/yourusername/QuantSystem)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+A limit order book, four execution-scheduling algorithms, and a deterministic
+execution engine that drives them, written in Rust. A gRPC API exposes the
+engine; a desktop client and Python bindings sit on top.
 
-> **A production-ready, high-performance algorithmic trading execution platform built from the ground up in Rust. Zero external dependencies for core matching engine. Battle-tested architecture handling 100K+ orders/second with microsecond latency.**
+The point of the project is execution quality rather than strategy: given a
+parent order to fill over a window, how should it be broken into child orders,
+and what did that cost against the price when the decision was made?
 
----
+Everything below is either a property checked by a test in this repository or a
+number measured by a benchmark in it. Where a component is simulated or a
+feature absent, that is stated rather than implied.
 
-## 🎯 The Problem We Solve
-
-**Trading isn't just about having a winning strategy — it's about executing it efficiently.**
-
-Imagine you need to buy 10,000 shares of a stock trading at $100. A naive market order would:
-- ❌ Eat through the order book, buying at progressively worse prices ($100 → $100.05 → $100.10...)
-- ❌ Alert high-frequency traders who front-run your order
-- ❌ Create market impact, moving prices against you
-- ❌ Cost you $3,000+ in unnecessary slippage
-
-**QuantSystem solves this** by implementing institutional-grade execution algorithms that minimize market impact, reduce transaction costs, and maximize execution quality.
+- Repository: <https://github.com/shaunak-batra/RustAlgoExecutionSystem>
+- Built and tested with stable Rust (rustc 1.91.1), edition 2021. No minimum
+  supported version is claimed, because none has been tested.
 
 ---
 
-## ✨ Key Features
+## Contents
 
-### 🎨 **Real-Time Trading GUI**
-- Modern egui-based interface with live order flow visualization
-- Multi-algorithm execution dashboard
-- Real-time P&L tracking (realized & unrealized)
-- Market depth visualization with bid/ask spread analysis
-- Performance metrics including VWAP, implementation shortfall, and Sharpe ratio
+- [What this is, and what it is not](#what-this-is-and-what-it-is-not)
+- [Build and run](#build-and-run)
+- [Architecture](#architecture)
+- [The order book](#the-order-book)
+- [The scheduling algorithms](#the-scheduling-algorithms)
+- [The execution engine](#the-execution-engine)
+- [gRPC API](#grpc-api)
+- [Python bindings](#python-bindings)
+- [Desktop client](#desktop-client)
+- [Testing](#testing)
+- [Benchmarks](#benchmarks)
+- [Configuration](#configuration)
+- [Limitations](#limitations)
+- [References](#references)
+- [Licence](#licence)
 
-### ⚡ **Ultra-High Performance**
-- **Order matching**: <10μs latency
-- **Throughput**: 100,000+ orders/second
-- **Memory efficient**: Zero-copy order book operations
-- **Thread-safe**: Lock-free concurrent execution where possible
-- **Production hardened**: All critical paths use checked arithmetic to prevent overflow
+---
 
-### 🧠 **Institutional-Grade Algorithms**
+## What this is, and what it is not
 
-#### 1. **TWAP** (Time-Weighted Average Price)
-Splits orders evenly over time to minimize detection.
-```rust
-// Execute 10,000 shares over 1 hour with randomized timing
-TwapParams {
-    start_ns: now,
-    end_ns: now + 3_600_000_000_000,  // 1 hour
-    total_qty: 10_000,
-    num_slices: 60,  // 1 per minute
-}
-```
+It is:
 
-#### 2. **Adaptive TWAP**
-TWAP with dynamic adjustment based on market volatility and urgency.
+- a single-symbol limit order book with price-time priority, integer tick
+  prices, GTC/IOC/FOK and market orders, and a full internal-consistency check;
+- four scheduling algorithms — TWAP, VWAP, POV and Almgren–Chriss
+  implementation shortfall — as pure functions over integers and `f64`, with the
+  closed forms derived in the code comments;
+- a deterministic execution engine: given the same inputs and the same
+  timestamps, it produces the same fills, because it never reads the clock
+  itself;
+- exact position and P&L accounting in `i128`, with the identity
+  `realized_pnl − cost_basis = net cash` checked by a property test;
+- pre-trade risk checks and a loss kill switch;
+- a gRPC service, a desktop client, and Python bindings for the algorithms.
 
-#### 3. **VWAP** (Volume-Weighted Average Price)
-Matches historical volume patterns to blend in with natural market flow.
-- Uses historical data to predict volume distribution
-- Validates data integrity (prevents execution with stale data)
-- Optimal for large institutional orders
+It is not:
 
-#### 4. **POV** (Percent of Volume)
-Executes as a fixed percentage of market volume.
-```rust
-// Participate at 10% of market volume
-PovParams {
-    participation_rate: 0.10,
-    max_qty_per_interval: 500,
-}
-```
+- connected to any exchange. Orders execute against a **simulated venue** in
+  this process: a market maker quotes a ladder around a fixed reference price
+  per symbol, fills consume that depth, and the next engine tick restores it.
+  The mid does not move in response to anything, so P&L out of the simulator
+  measures the scheduler against a static book, not against a market.
+- a backtester. There is no historical replay, no commission model and no
+  slippage model. An earlier version of this repository contained all three;
+  they were removed because they were wrong (commissions were configured and
+  never charged, signals executed at the same bar's close that produced them,
+  and short positions added to equity instead of subtracting).
+- low latency in any end-to-end sense. The figures under
+  [Benchmarks](#benchmarks) are in-process microbenchmarks of book operations on
+  one machine. Nothing here has been measured across a network, and no part of
+  the system is lock-free.
+- authenticated. The gRPC server has no authentication or TLS; keep it on a
+  loopback address, which is what the shipped configuration does.
 
-#### 5. **Implementation Shortfall** (IS)
-Balances urgency against market impact to minimize total cost.
+---
 
-### 🛡️ **Enterprise Risk Management**
+## Build and run
 
-#### Pre-Trade Risk Checks
-- ✅ Position limit validation
-- ✅ Order size limits (prevents fat-finger errors)
-- ✅ Notional exposure caps
-- ✅ Price collar validation (min/max price bounds)
-
-#### Post-Trade Risk Checks
-- ✅ Total portfolio notional exposure monitoring
-- ✅ Circuit breakers for excessive losses (halt trading at -50% threshold)
-- ✅ Position concentration limits
-- ✅ Real-time P&L monitoring
-
-#### Thread Safety & Data Integrity
-- ✅ Checked arithmetic everywhere (prevents silent integer overflow)
-- ✅ Thread-safe smart order routing
-- ✅ Atomic operations for orderbook depth tracking
-- ✅ Race condition prevention in market maker seeding
-
-### 📊 **Advanced Order Types**
-
-- **Market Orders**: Immediate execution at best available price
-- **Limit Orders**: Price-guaranteed execution
-- **FOK** (Fill-or-Kill): All-or-nothing execution
-- **IOC** (Immediate-or-Cancel): Fill available, cancel rest
-- **Stop Orders**: Trigger-based conditional execution
-- **Iceberg Orders**: Hide true order size (show small tip, large hidden)
-- **Pegged Orders**: Dynamic pricing relative to market (mid-peg, primary-peg)
-
-### 📈 **Comprehensive Analytics**
-
-#### Performance Metrics
-- **VWAP Tracking**: Real-time comparison vs. market VWAP
-- **Implementation Shortfall**: Cost relative to decision price
-- **Arrival Price Slippage**: Execution quality measurement
-- **Market Impact**: Quantified price movement from your orders
-- **Sharpe Ratio**: Risk-adjusted return calculation
-- **Maximum Drawdown**: Worst peak-to-trough decline
-- **Win Rate**: Percentage of profitable trades
-
-#### Backtesting Engine
-```rust
-let mut engine = BacktestEngine::new(
-    strategy,
-    initial_capital: 100_000.0,
-    commission_rate: 0.001,
-    slippage_rate: 0.0001,
-);
-
-let results = engine.run(&market_data);
-println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
-println!("Max Drawdown: {:.2}%", results.max_drawdown * 100.0);
-```
-
-### 🔌 **Multi-Language Support**
-
-#### Python Bindings
-```python
-import algo_exec_rs
-
-# Execute TWAP directly from Python
-schedule = algo_exec_rs.compute_twap(
-    start_ns=0,
-    end_ns=3600_000_000_000,
-    total_qty=10000,
-    num_slices=60
-)
-
-for order in schedule:
-    print(f"Time: {order.target_time_ns}, Qty: {order.qty}")
-```
-
-#### gRPC API
 ```bash
-# Start the gRPC server
-cargo run --bin grpc-server
+git clone https://github.com/shaunak-batra/RustAlgoExecutionSystem.git
+cd RustAlgoExecutionSystem
 
-# Submit orders from any language
-grpcurl -plaintext localhost:50051 list
-```
-
-### 🔄 **Market Data Integration**
-
-#### Live Data Sources
-- **Binance WebSocket**: Real-time crypto market data
-- **REST API Fallback**: Automatic failover on connection loss
-- **Simulated Feed**: Built-in market simulator for testing
-
-#### Data Quality
-- ✅ Automatic reconnection with exponential backoff
-- ✅ Message validation and error handling
-- ✅ Graceful degradation (WebSocket → REST → Simulated)
-- ✅ Lag detection with client notification
-
----
-
-## 🏗️ Architecture
-
-### System Design
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Trading GUI (egui)                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ Order Entry  │  │  Positions   │  │  Analytics   │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└────────────────────────┬────────────────────────────────────┘
-                         │ gRPC / Channel
-┌────────────────────────▼────────────────────────────────────┐
-│                  Execution Engine Core                       │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Event Loop (100ms tick)                             │   │
-│  │  - Order submission & lifecycle management           │   │
-│  │  - Clock-driven execution scheduling                 │   │
-│  │  - Fill generation & distribution                    │   │
-│  └──────────────────────────────────────────────────────┘   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │ Risk Manager │  │ State Store  │  │ Smart Router │     │
-│  │ Pre/Post     │  │ Positions    │  │ Multi-venue  │     │
-│  │ Trade Checks │  │ Orders       │  │ Liquidity    │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│              Order Book Matching Engine                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  Price-Time Priority Matching                        │   │
-│  │  - BTreeMap-based level storage                      │   │
-│  │  - O(log n) insert/delete operations                 │   │
-│  │  - Zero-copy order matching                          │   │
-│  │  - Depth tracking with atomic updates                │   │
-│  └──────────────────────────────────────────────────────┘   │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│                   Market Data Feeds                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │   Binance    │  │   REST API   │  │  Simulated   │      │
-│  │  WebSocket   │  │   Fallback   │  │     Feed     │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Crate Structure
-
-```
-quantsystem/
-├── 📦 crates/
-│   ├── orderbook/         # Core matching engine (zero deps)
-│   │   ├── book.rs        # Price-time priority order book
-│   │   ├── types.rs       # Price, Quantity, Timestamp wrappers
-│   │   ├── advanced_orders.rs  # Stop, iceberg, pegged orders
-│   │   └── simulation.rs  # Market impact simulation
-│   │
-│   ├── algo-core/         # Execution algorithms (pure functions)
-│   │   ├── twap.rs        # Time-weighted average price
-│   │   ├── vwap.rs        # Volume-weighted average price
-│   │   ├── pov.rs         # Percent of volume
-│   │   ├── is.rs          # Implementation shortfall
-│   │   └── adaptive_twap.rs  # Adaptive TWAP
-│   │
-│   ├── engine/            # Execution engine
-│   │   ├── event_loop.rs  # Main event processing
-│   │   ├── state.rs       # Position & order state
-│   │   ├── risk.rs        # Risk management
-│   │   └── routing.rs     # Smart order routing
-│   │
-│   ├── api/               # gRPC server
-│   │   ├── server.rs      # gRPC service implementation
-│   │   └── types.rs       # API data types
-│   │
-│   ├── analytics/         # Performance metrics
-│   │   └── lib.rs         # Sharpe, drawdown, win rate
-│   │
-│   ├── market-data/       # Market data feeds
-│   │   ├── websocket.rs   # Binance WebSocket client
-│   │   └── feed.rs        # Simulated market data
-│   │
-│   ├── backtesting/       # Historical simulation
-│   │   ├── lib.rs         # Backtest engine
-│   │   └── replay.rs      # Market replay from CSV
-│   │
-│   ├── database/          # Trade persistence
-│   │   └── lib.rs         # SQLite storage
-│   │
-│   ├── indicators/        # Technical analysis
-│   │   └── lib.rs         # SMA, EMA, RSI, MACD, Bollinger
-│   │
-│   ├── trader-gui/        # Desktop application
-│   │   └── main.rs        # egui-based GUI
-│   │
-│   └── python-bindings/   # PyO3 Python interface
-│       └── lib.rs         # Python module exports
-│
-├── 📄 proto/              # Protocol buffers
-│   └── execution.proto    # gRPC service definitions
-│
-└── 🐍 python/             # Python examples
-    └── examples/          # Usage demonstrations
-```
-
----
-
-## 🚀 Quick Start
-
-### Installation
-
-#### Prerequisites
-```bash
-# Install Rust (1.70+)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup default stable
-
-# Windows: Install Visual Studio 2022 with C++ tools
-# Linux/Mac: You're good to go!
-```
-
-#### Build
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/QuantSystem.git
-cd QuantSystem
-
-# Build in release mode (optimized)
 cargo build --release
-
-# Run tests (98 tests, all passing)
-cargo test --release
-
-# Expected output:
-# test result: ok. 98 passed; 0 failed
+cargo test --workspace          # 170 tests
 ```
 
-### Your First Trade
+`protoc` is vendored through `protoc-bin-vendored`, so a clean clone builds with
+no system protobuf installation and no generated files in version control.
 
-#### 1. Start the GUI
+Run the engine, then the client:
+
 ```bash
-cargo run --release --bin trader-gui
+cargo run --release --bin engine                      # serves config/default.toml
+cargo run --release --bin engine -- --config my.toml  # or your own settings
+cargo run --release --bin trader-gui                  # connects to 127.0.0.1:50051
 ```
 
-#### 2. Launch the Execution Engine
+The engine logs through `tracing`; set `RUST_LOG=debug` for more detail. It
+shuts down on Ctrl-C, draining in-flight commands first.
+
+Run the tests in both profiles. The debug profile keeps integer-overflow checks
+on, and release exercises optimisation-dependent behaviour:
+
 ```bash
-# In another terminal
-cargo run --release --bin engine-server
-```
-
-#### 3. Submit a TWAP Order
-In the GUI:
-- Symbol: `BTC-USD`
-- Side: `Buy`
-- Quantity: `1000`
-- Algorithm: `TWAP`
-- Duration: `60 minutes`
-- Slices: `60` (1 per minute)
-
-#### 4. Watch It Execute
-You'll see:
-- ✅ Real-time order slice generation
-- ✅ Live fills as they occur
-- ✅ Position building up incrementally
-- ✅ P&L updating in real-time
-- ✅ Execution vs. VWAP comparison
-
----
-
-## 📖 Algorithm Deep Dive
-
-### TWAP (Time-Weighted Average Price)
-
-**Goal**: Execute evenly over time to minimize detection and market impact.
-
-**When to use**:
-- Large orders in liquid markets
-- When you don't have strong directional conviction
-- Need to execute over a specific time period
-
-**Algorithm**:
-```rust
-pub fn compute_twap_schedule(params: TwapParams) -> Vec<ChildOrderInstruction> {
-    let slice_duration = (params.end_ns - params.start_ns) / params.num_slices as u64;
-    let base_qty = params.total_qty / params.num_slices as u64;
-    let remainder = params.total_qty % params.num_slices as u64;
-
-    (0..params.num_slices).map(|i| {
-        let target_time = params.start_ns + i as u64 * slice_duration;
-        let qty = base_qty + if i < remainder as usize { 1 } else { 0 };
-        ChildOrderInstruction { target_time_ns: target_time, qty }
-    }).collect()
-}
-```
-
-**Example Output**:
-```
-Total Qty: 1000 shares over 60 minutes
-Slice 0: Time 14:00:00, Qty 17
-Slice 1: Time 14:01:00, Qty 17
-...
-Slice 59: Time 14:59:00, Qty 16
-```
-
-**Randomized TWAP**: Adds jitter (±25% of slice duration) to prevent detection by statistical arbitrage strategies.
-
----
-
-### VWAP (Volume-Weighted Average Price)
-
-**Goal**: Match historical volume patterns to minimize market impact.
-
-**When to use**:
-- Very large orders (>5% of ADV)
-- When historical volume patterns are predictive
-- Benchmark execution against market VWAP
-
-**Key Innovation**: We validate that historical data falls within the execution window:
-
-```rust
-// Validate timestamp coverage
-let has_data_in_window = historical_data
-    .iter()
-    .any(|(ts, _, _)| *ts >= params.start_ns && *ts < params.end_ns);
-
-if !has_data_in_window {
-    return Err(VwapError::NoDataInWindow {
-        start: params.start_ns,
-        end: params.end_ns
-    });
-}
-```
-
-**Volume Distribution**:
-```rust
-// Calculate volume-weighted quantity per slice
-for i in 0..params.num_slices {
-    let slice_start = params.start_ns + (i as u64 * slice_duration);
-    let slice_end = slice_start + slice_duration;
-
-    let slice_volume: u64 = historical_data
-        .iter()
-        .filter(|(ts, _, _)| *ts >= slice_start && *ts < slice_end)
-        .map(|(_, _, vol)| vol)
-        .sum();
-
-    let volume_fraction = slice_volume as f64 / total_volume as f64;
-    let qty = (params.total_qty as f64 * volume_fraction) as u64;
-
-    schedule.push(VwapOrderInstruction {
-        target_time_ns: slice_start,
-        qty,
-        expected_vwap: slice_vwap
-    });
-}
+cargo test --workspace
+cargo test --workspace --release
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
 ---
 
-### POV (Percent of Volume)
+## Architecture
 
-**Goal**: Execute as a fixed percentage of market volume.
-
-**When to use**:
-- Need to blend in with natural market flow
-- Market has varying liquidity throughout the day
-- Want to complete within a volume target (e.g., "buy 10% of today's volume")
-
-**Dynamic Participation**:
-```rust
-impl PovExecutor {
-    pub fn calculate_order_qty(&self, market_volume: u64) -> u64 {
-        let target_qty = (market_volume as f64 * self.participation_rate) as u64;
-        target_qty.min(self.max_qty_per_interval)
-    }
-}
+```text
+            ┌──────────────────────┐        ┌───────────────────────┐
+            │   trader-gui         │        │  python/              │
+            │   desktop client     │        │  algo_exec_py         │
+            └──────────┬───────────┘        └───────────┬───────────┘
+                       │ gRPC                           │ PyO3
+            ┌──────────▼───────────┐                    │
+            │   api                │                    │
+            │   tonic service      │                    │
+            └──────────┬───────────┘                    │
+                       │ mpsc commands, oneshot replies │
+                       │ broadcast fills                │
+            ┌──────────▼───────────────────────────┐    │
+            │   engine                             │    │
+            │   EngineCore: submit / cancel / tick │    │
+            │   accounting · risk · venue · state  │    │
+            └──────────┬───────────────┬───────────┘    │
+                       │               │                │
+            ┌──────────▼─────┐  ┌──────▼────────────────▼───┐
+            │   orderbook    │  │   algo-core               │
+            │   matching     │  │   TWAP VWAP POV IS        │
+            └────────────────┘  └───────────────────────────┘
 ```
+
+Seven crates, each with a single responsibility:
+
+| Crate | Responsibility |
+| --- | --- |
+| `orderbook` | Limit order book, price/quantity/timestamp types. Depends only on `serde` and `thiserror`. |
+| `algo-core` | The four schedulers as pure functions. No I/O, no clock. |
+| `engine` | `EngineCore` state machine, exact accounting, pre-trade risk, the simulated venue, and the async actor that owns them. |
+| `api` | Protobuf definitions and the tonic service; translates requests into engine commands. |
+| `config` | TOML settings with unknown-key rejection and range validation. |
+| `python-bindings` | PyO3 wrapper around `algo-core`, built as `algo_exec_py._native`. |
+| `trader-gui` | egui client. Displays engine state only. |
 
 ---
 
-### Implementation Shortfall
+## The order book
 
-**Goal**: Minimize total trading cost (market impact + opportunity cost).
+`orderbook::OrderBook` is a single-symbol book. Bids and asks are
+`BTreeMap<Price, Level>`; each level holds a `VecDeque<Order>` in arrival order;
+a `HashMap<OrderId, (Side, Price)>` index means a cancel never scans the book.
 
-**Cost Components**:
-1. **Market Impact**: Price movement from your order
-2. **Timing Risk**: Price moves against you while waiting
-3. **Opportunity Cost**: Unexecuted portion if price runs away
+- Prices are integer ticks (`TICK_SCALE = 100_000`, five decimal places), so
+  level lookup and comparison are exact and floating point appears only at the
+  boundaries. `Price::try_from_f64` rejects NaN, infinities and anything whose
+  rounded tick count reaches either end of the `i64` range, symmetrically.
+- A trade executes at the resting order's price. The best level fills first;
+  within a level, earlier orders fill first; a partially filled resting order
+  keeps its queue position.
+- Time in force decides the outcome, for limit and market orders alike: a GTC
+  remainder rests, an IOC remainder is cancelled, and a FOK order either trades
+  in full immediately or does nothing at all.
+- `check_invariants()` verifies, in expected `O(n)`: no empty levels, no id
+  resting twice, cached level totals equal to the sum of their orders, an id
+  index matching the resting orders exactly, every resting order a GTC limit
+  order on the correct side and level, and an uncrossed book.
 
-**Optimization**:
-```rust
-let urgency_factor = remaining_time / total_time;
-let volatility_adjustment = market_volatility * 0.5;
+Complexity, with `L` levels on a side and `k` orders at one level. Index work is
+hash-map work, so those bounds are expected and amortised:
 
-// Higher urgency or volatility → execute faster
-let execution_rate = base_rate * (1.0 + urgency_factor + volatility_adjustment);
-```
+| Operation | Bound |
+| --- | --- |
+| `submit_order` | `O(log L)` per level touched, plus expected amortised `O(1)` per order filled or rested |
+| `cancel_order` | expected `O(1)` index lookup, `O(log L)` level lookup, `O(k)` within the level |
+| `best_bid` / `best_ask` | `O(log L)` |
 
----
-
-## 🎨 GUI Features
-
-### Order Entry Panel
-```
-┌─────────────────────────────────┐
-│ Symbol: [BTC-USD        ▼]     │
-│ Side:   ( ) Buy  (•) Sell      │
-│ Qty:    [10000          ]      │
-│                                 │
-│ Algorithm: [TWAP        ▼]     │
-│ Duration:  [60 minutes  ]      │
-│ Slices:    [60          ]      │
-│                                 │
-│        [ Submit Order ]         │
-└─────────────────────────────────┘
-```
-
-### Live Position Monitor
-```
-┌──────────────────────────────────────────────────┐
-│ Symbol    │ Position │ Avg Price │ P&L       │
-├───────────┼──────────┼───────────┼───────────┤
-│ BTC-USD   │ +8,523   │ 42,150.23 │ +$12,431  │
-│ ETH-USD   │ -1,200   │  2,341.12 │  -$2,891  │
-└──────────────────────────────────────────────────┘
-```
-
-### Order Flow Visualization
-```
-Time                Qty    Price      Side
-14:32:15.123       250    42,150.50  BUY  ●
-14:32:16.456       250    42,151.00  BUY  ●
-14:32:17.789       250    42,150.75  BUY  ●
-```
-
-### Market Depth Chart
-```
-Bid Side        Price      Ask Side
-█████ 1000   42,150.00   500 ████
-████ 800     42,149.50   600 ████
-███ 600      42,149.00   400 ███
-```
+How it is checked: 38 unit tests, one doctest, and a property test that replays
+up to 79 random operations against a deliberately naive reference
+implementation, comparing every execution report, every cancel, full depth on
+both sides, the order count and the invariants after each step
+(`crates/orderbook/tests/reference_model.rs`, 512 cases).
 
 ---
 
-## 📊 Performance Benchmarks
+## The scheduling algorithms
 
-### Order Book Operations
-```
-Operation          Latency    Throughput
-─────────────────────────────────────────
-Insert Order       8.2 μs     121,951 ops/sec
-Match Orders       5.7 μs     175,439 ops/sec
-Cancel Order       4.1 μs     243,902 ops/sec
-Query Best Bid     0.3 μs     3,333,333 ops/sec
-Update Depth       1.2 μs     833,333 ops/sec
+All four return `Result`, validate their inputs, and never panic. Quantities are
+integers that sum exactly to the order size — for POV, to what the observed
+volume allowed.
+
+### TWAP
+
+Equal quantities per time slice, to within one unit. Slice `k` starts at
+`start + ⌊k · duration / slices⌋`. The quantity complete after slice `k` is
+`total · (k+1) / slices` rounded to the nearest unit with ties up, computed in
+`u128` as `q·k + ⌊r·k/n⌋ + [2(r·k mod n) ≥ n]`, so nothing overflows even at
+`u64::MAX` over a million slices, and any remainder is spread across the window
+instead of front-loaded. Slices that round to zero are omitted.
+
+`compute_twap_randomized` draws each release time uniformly inside its own slice
+using SplitMix64, so the schedule is reproducible from the seed on any platform
+while release times are not predictable from a fixed clock. One draw is made per
+slice, including slices whose quantity rounds to zero, so slice `k`'s time
+depends on the seed, the window, the slice count and `k` — never on the total
+quantity. A pinned golden schedule and an independent Python implementation of
+the generator both check this.
+
+### VWAP
+
+Quantities in proportion to a volume profile, one non-negative weight per slice.
+The cumulative target is rounded rather than each slice independently, which
+keeps the rounding error from accumulating: prefix `k` lands within half a unit
+of `total × cumulative[k]` as evaluated in `f64`, plus the error of that
+evaluation. Because the profile's cumulative shares are themselves `f64` sums,
+that second term grows with the slice count at very large totals — the
+documentation states the bound it actually has rather than an unconditional half
+unit. The curve stops at the last slice with volume, so a zero-weight slice
+never receives a child order, including above `2^53` where a rounded `f64` target
+cannot reach the total exactly.
+
+`volume_profile_from_bars` pools historical bars by time of day across days and
+returns each slice's share, so a busier day weighs more. Its fractions sum to 1
+up to floating-point rounding.
+
+### POV
+
+Participation in integer basis points of observed volume. After each observation
+inside the window the cumulative target is
+`min(total, ⌊cumulative volume × bps / 10 000⌋)`, computed in `u128`, and any
+increase is released at that observation's timestamp. Exact integer arithmetic
+means the cumulative scheduled quantity can never exceed the participation rate
+times cumulative volume. Quantity the volume did not permit is reported as
+`shortfall_qty` rather than silently dropped.
+
+The timing is a convention about the input, which the documentation says
+plainly: a child is released at the timestamp of the observation that allowed
+it, so `timestamp_ns` must be when the volume became known — a bar's close, not
+its open. A property test checks prefix invariance: once every observation
+carrying a timestamp has been seen, that timestamp's child is settled and later
+data cannot change it.
+
+### Implementation shortfall (Almgren–Chriss)
+
+Trading `X` units over `N` slices of length `τ`, with holdings
+`x_0 = X, …, x_N = 0` and `n_k = x_{k−1} − x_k`:
+
+```text
+E = ½γX² + (η̃/τ)·Σ n_k²        η̃ = η − ½γτ
+V = σ²τ·Σ_{k≥1} x_k²
 ```
 
-### Algorithm Execution
-```
-Algorithm          Setup Time   Memory Usage
-──────────────────────────────────────────
-TWAP (1000 slices) 23 μs       48 KB
-VWAP (complex)     156 μs      128 KB
-POV                12 μs       32 KB
-```
+Minimising `E + λV` gives `x_j = X·sinh(κ(T − t_j)) / sinh(κT)` with `κ` solving
+`(2/τ²)(cosh(κτ) − 1) = λσ²/η̃`. The schedule is the same for buying and
+selling; the fixed spread cost `ε` is omitted because it adds `ε·X` to every
+one-directional schedule and so cannot change the optimum.
 
-### Memory Footprint
-```
-Component              Memory
-─────────────────────────────
-Order Book (10K orders)  2.4 MB
-Engine State             1.1 MB
-Market Data Buffer       512 KB
-GUI (running)            18 MB
-Total (steady state)     22 MB
-```
+Numerically: `κτ = acosh(1 + y)` is evaluated as `ln_1p(y + √(y(y+2)))`, which
+keeps the `√(2y)` behaviour for tiny `y` where `1 + y` rounds to 1, and factors
+`y` out of the square root for huge `y` where `y(y+2)` would overflow and reject
+a `κ` that is perfectly finite. The `sinh` ratio is evaluated through `exp_m1`
+so that `κT` in the hundreds does not produce `inf/inf`.
+
+With `λ = 0` the trajectory is exactly linear and the schedule is TWAP, down to
+the same integer child quantities. That equivalence is delegated to TWAP's
+rounding rather than re-derived from the float curve, because rounding
+`1 − x/total` lands on the wrong side of an exact half for sizes such as 9 units
+over 6 slices. A sweep over 39 slice counts × 203 sizes checks it.
+
+Correctness is pinned by more than a regression test: the holdings match the
+textbook `sinh` formula for `λ` from `1e-11` to `1e-1`; `κ` satisfies the
+discrete urgency equation to within `1e-9` relative; the first-order optimality
+condition `(η̃/τ²)(x_{k−1} − 2x_k + x_{k+1}) = λσ²x_k` holds at every interior
+point; the closed-form cost matches an independent summation; and a trajectory
+rebuilt with `κ` off by 5% costs strictly more.
 
 ---
 
-## 🔧 Configuration
+## The execution engine
 
-### Risk Limits
-```rust
-// crates/engine/src/risk.rs
-pub struct RiskConfig {
-    pub max_position: u64,           // 1,000,000 shares
-    pub max_order_size: u64,         // 100,000 shares per order
-    pub max_order_notional: f64,     // $10,000,000 per order
-    pub max_total_notional: f64,     // $50,000,000 total exposure
-    pub min_price: Price,            // $0.01 minimum
-    pub max_price: Price,            // $1,000,000 maximum
-}
-```
+`EngineCore` is a single-owner state machine. Its entire API is `submit`,
+`cancel`, `tick`, `halt`, `positions` and `order_status`, and every decision is
+a function of the timestamp passed in — it never reads the clock. That is what
+makes a run reproducible: the same commands with the same timestamps produce the
+same fills, which a determinism test asserts directly.
 
-### Execution Engine
-```rust
-// crates/engine/src/event_loop.rs
-let engine = ExecutionEngine::new("BTC-USD".to_string(), 100) // 100ms tick
-    .with_risk_config(custom_risk_config);
-```
+Around it, `ExecutionEngine` is an async actor: commands arrive on an `mpsc`
+channel, replies go back on `oneshot` channels, and fills fan out on a
+`broadcast` channel. There are no locks and no shared mutable state, because one
+task owns everything.
 
-### Market Data
-```rust
-// crates/market-data/src/websocket.rs
-pub struct WebSocketConfig {
-    pub websocket_url: String,
-    pub reconnect_attempts: usize,   // 5 retries
-    pub reconnect_delay_ms: u64,     // 1000ms between retries
-    pub fallback_on_failure: bool,   // true → switch to REST
-}
-```
+On each tick the engine releases every child order that has come due, as an IOC
+order, and carries any unfilled quantity forward to the next slice rather than
+abandoning it. Child orders are stamped with the time they are actually
+submitted, not the time they were scheduled for. A slice whose quantity rounds
+to zero is skipped rather than sent to the book.
+
+**Accounting** is exact. Positions and P&L are `i128` in units of price ticks ×
+quantity, including the flip case where a fill crosses through zero and part of
+it closes the old position while the rest opens a new one. A property test
+asserts the identity `realized_pnl − cost_basis = net cash` over random fill
+sequences, and an integration test checks a round trip where the numbers are
+known exactly.
+
+**Risk** is checked before an order is accepted: per-order quantity; per-order
+notional priced at the worse of the limit price and the mid; a price collar in
+basis points of the mid; the absolute position per symbol assuming every working
+order fills; and gross exposure across symbols. Trading halts once total P&L
+(realised plus unrealised at the mid) reaches the configured loss limit, and the
+halt reason is reported over the API.
 
 ---
 
-## 🧪 Testing
+## gRPC API
 
-### Unit Tests
+`proto/execution.proto` defines five calls. The schema uses typed enums, a
+`oneof` for the algorithm parameters, and `optional` fields rather than sentinel
+values such as a zero price meaning "no limit".
+
+| Call | Returns |
+| --- | --- |
+| `SubmitParentOrder` | `accepted`, the new id, or a `reject_reason` |
+| `CancelParentOrder` | whether the remaining quantity was cancelled, or why not |
+| `GetOrderStatus` | state, filled quantity, arrival mid, average fill price, shortfall in bps, slices still to release, and every child order |
+| `GetPositions` | a report per symbol, plus whether risk has halted trading and why |
+| `StreamFills` | a server stream of fill events |
+
+Error semantics are deliberate, because conflating these two is a common way for
+a client to mis-handle rejections:
+
+- A **business rejection** — failing a risk limit, an unknown symbol, an invalid
+  window — returns `accepted = false` with a reason, as a successful RPC.
+- A **malformed request** returns `INVALID_ARGUMENT`; an unknown order id
+  returns `NOT_FOUND`; the engine being gone returns `UNAVAILABLE`.
+- A fill subscriber that falls behind has its stream ended with `DATA_LOSS` and a
+  message telling it to resubscribe and reconcile through `GetOrderStatus`,
+  rather than silently missing fills.
+
+POV is absent from this API on purpose. `algo_core::pov` is implemented and
+tested, but the simulated venue publishes no per-order volume feed for a
+participation rate to track, so POV is reachable from the library and the Python
+bindings instead.
+
+---
+
+## Python bindings
+
+A PyO3 extension built with maturin in a mixed layout: the pure-Python package
+`algo_exec_py` ships with the compiled module installed inside it as
+`algo_exec_py._native`.
+
 ```bash
-# Run all tests
-cargo test --release
-
-# Run specific crate tests
-cargo test --release -p orderbook
-cargo test --release -p algo-core
-cargo test --release -p engine
-
-# Run with output
-cargo test --release -- --nocapture
+pip install -r python/requirements.txt
+pip install ./python
+pytest python/tests -q          # 67 cases
 ```
 
-### Integration Tests
-```bash
-# Full system test
-cargo test --release --test integration_test
-
-# Backtest validation
-cargo test --release --test backtest_validation
-```
-
-### Test Coverage
-```
-Crate             Tests    Coverage
-────────────────────────────────────
-orderbook          28      94%
-algo-core          24      92%
-engine             13      89%
-api                 8      87%
-analytics           6      91%
-market-data         5      85%
-backtesting         2      88%
-indicators          5      90%
-────────────────────────────────────
-Total              98      90%
-```
-
----
-
-## 🐛 Troubleshooting
-
-### Build Errors
-
-**Error**: `linker 'link.exe' not found`
-```bash
-# Solution: Install Visual Studio 2022 with C++ tools
-# Or on Linux: sudo apt-get install build-essential
-```
-
-**Error**: `cannot find crate for 'std'`
-```bash
-# Solution: Ensure rust is properly installed
-rustup default stable
-rustup update
-```
-
-### Runtime Issues
-
-**Problem**: Orders not executing
-- ✅ Check that execution engine is running
-- ✅ Verify risk limits aren't blocking orders
-- ✅ Ensure market data feed is connected
-- ✅ Check logs: `tail -f logs/engine.log`
-
-**Problem**: GUI not updating
-- ✅ Verify gRPC server is running on port 50051
-- ✅ Check for firewall blocking localhost connections
-- ✅ Restart GUI application
-
-**Problem**: High latency
-- ✅ Build with `--release` flag (debug builds are 10-100x slower)
-- ✅ Check system load (CPU, memory)
-- ✅ Reduce tick interval if needed
-
----
-
-## 🚢 Deployment
-
-### Production Checklist
-
-#### Performance
-- [x] Build with `--release` flag
-- [x] Enable LTO (Link-Time Optimization) in Cargo.toml
-- [x] Set `panic = 'abort'` for smaller binaries
-- [x] Tune thread pool sizes based on core count
-
-#### Monitoring
-- [x] Set up logging (tracing crate)
-- [x] Configure log rotation
-- [x] Enable Prometheus metrics export
-- [x] Set up alerting for risk breaches
-
-#### Safety
-- [x] Enable all risk checks
-- [x] Set conservative position limits
-- [x] Configure circuit breakers
-- [x] Test failover scenarios
-
-### Docker Deployment
-```dockerfile
-FROM rust:1.75 as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/engine-server /usr/local/bin/
-CMD ["engine-server"]
-```
-
-### Kubernetes
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: quantsystem-engine
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: quantsystem-engine
-  template:
-    metadata:
-      labels:
-        app: quantsystem-engine
-    spec:
-      containers:
-      - name: engine
-        image: quantsystem/engine:latest
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "500m"
-          limits:
-            memory: "1Gi"
-            cpu: "2000m"
-```
-
----
-
-## 🔌 API Reference
-
-### gRPC Service
-
-#### Submit Order
-```protobuf
-rpc SubmitParentOrder(OrderRequest) returns (OrderResponse);
-
-message OrderRequest {
-    string symbol = 1;
-    Side side = 2;
-    uint64 qty = 3;
-    optional double limit_price = 4;
-    uint64 start_ns = 5;
-    uint64 end_ns = 6;
-    uint32 num_slices = 7;
-}
-```
-
-#### Query Position
-```protobuf
-rpc GetPositions(PositionsRequest) returns (PositionsResponse);
-
-message PositionsResponse {
-    string symbol = 1;
-    int64 position = 2;
-    double realized_pnl = 3;
-    double unrealized_pnl = 4;  // Calculated with current market price
-}
-```
-
-#### Stream Fills
-```protobuf
-rpc StreamFills(StreamFillsRequest) returns (stream FillEvent);
-
-message FillEvent {
-    uint64 order_id = 1;
-    uint64 fill_qty = 2;
-    int64 fill_price_ticks = 3;
-    uint64 timestamp_ns = 4;
-}
-```
-
-### Python API
 ```python
-import algo_exec_rs
+import algo_exec_py as ae
 
-# Compute TWAP schedule
-schedule = algo_exec_rs.compute_twap(
-    start_ns=0,
-    end_ns=3600_000_000_000,  # 1 hour in nanoseconds
-    total_qty=10000,
-    num_slices=60
+# (target_time_ns, qty) per child order
+ae.twap_schedule(start_ns=0, end_ns=10_000_000_000, total_qty=1_000, num_slices=10)
+ae.twap_schedule_randomized(0, 10_000_000_000, 1_000, 10, seed=42)
+
+profile = ae.volume_profile_from_bars(bars, start_offset_ns, duration_ns, num_slices)
+ae.vwap_schedule(0, 10_000_000_000, 1_000, profile)
+
+# dicts: children, scheduled_qty, shortfall_qty
+ae.pov_schedule(0, 1_000, 10_000, 1_000, [(1, 500), (2, 500)])
+
+# dict: children, holdings, kappa, expected_cost, cost_variance
+ae.almgren_chriss_schedule(
+    start_ns=0, end_ns=3_600_000_000_000, total_qty=100_000, num_slices=12,
+    risk_aversion=1e-3, volatility=0.02, temporary_impact=0.5, permanent_impact=1e-6,
 )
-
-# Compute VWAP schedule
-historical_data = [
-    (timestamp_ns, price, volume),
-    # ... more data
-]
-
-schedule = algo_exec_rs.compute_vwap(
-    start_ns=0,
-    end_ns=3600_000_000_000,
-    total_qty=10000,
-    num_slices=60,
-    historical_data=historical_data
-)
-
-# Access results
-for order in schedule:
-    print(f"Execute {order.qty} shares at {order.target_time_ns}")
 ```
+
+Which exception a bad argument raises depends on how it is wrong, because
+arguments are converted to Rust types before any scheduler runs: the wrong type
+raises `TypeError`, an integer outside its parameter's range raises
+`OverflowError`, and a value the scheduler rejects raises `ValueError` carrying
+the Rust error message.
+
+`requires-python` is `>=3.9,<3.14`: PyO3 0.22 supports CPython 3.13 at the
+newest, and without the cap `pip` on 3.14 starts a build that then fails in the
+compiler. CI runs both ends of that range.
+
+The test suite compares the bindings against independent pure-Python
+implementations of the same definitions — integer TWAP rounding, SplitMix64 and
+the multiply-shift draw, the Almgren–Chriss closed form, the POV cap — so a
+mistake in the Rust shows up as a mismatch rather than as two copies of the same
+error agreeing.
 
 ---
 
-## 📚 Mathematical Foundations
+## Desktop client
 
-### Market Impact Models
+An egui application that is a thin client of the engine. Every value it shows
+comes from a gRPC reply: parent order state and child orders, positions with
+their mark prices, streamed fills, and the risk halt. It holds no market data
+source of its own and simulates nothing.
 
-#### Almgren-Chriss Model
-Estimates market impact from large orders:
-
-```
-Permanent Impact = η * (V / V_daily)
-Temporary Impact = γ * (v / V_daily)^(1/2)
-
-Where:
-  V = Total order volume
-  v = Instantaneous execution rate
-  V_daily = Average daily volume
-  η, γ = Market impact coefficients
-```
-
-**Implementation**: `crates/orderbook/src/simulation.rs:75`
-
-#### Square-Root Law
-Market impact scales with the square root of order size:
-
-```
-Impact ≈ σ * sqrt(Q / V)
-
-Where:
-  σ = Daily volatility
-  Q = Order quantity
-  V = Daily volume
-```
-
-### Performance Metrics
-
-#### Implementation Shortfall
-```
-IS = (Execution_Price - Decision_Price) / Decision_Price
-
-Components:
-  - Market Impact (controllable)
-  - Timing Risk (market moves during execution)
-  - Opportunity Cost (unexecuted portion)
-```
-
-#### Sharpe Ratio
-```
-Sharpe = (R - Rf) / σ
-
-Where:
-  R = Average return
-  Rf = Risk-free rate (2% annually)
-  σ = Standard deviation of returns
-```
-
-**Implementation**: `crates/analytics/src/lib.rs:145`
-
-#### VWAP Comparison
-```
-VWAP_Slippage = (Execution_VWAP - Market_VWAP) / Market_VWAP
-
-Market_VWAP = Σ(Price_i * Volume_i) / Σ(Volume_i)
-```
+It offers TWAP, VWAP and implementation shortfall — the three the API accepts —
+with the parameters each one actually takes, and it sends the algorithm that is
+selected. Limit prices are converted through `Price::try_from_f64`, so the field
+means what it says. Form parsing and every unit conversion are pure functions
+with unit tests (15 of them), which is why a bug like sending a price in whole
+units instead of ticks now fails a test.
 
 ---
 
-## 🎓 Learning Resources
+## Testing
 
-### Understanding Execution Algorithms
+170 Rust tests, which must pass in debug and release, with
+`clippy --workspace --all-targets -- -D warnings` clean:
 
-**Recommended Reading**:
-1. *Algorithmic Trading & DMA* by Barry Johnson
-2. *Optimal Trading Strategies* by Robert Kissell
-3. *Dark Pools* by Scott Patterson
+| Crate | Unit | Doc | Integration |
+| --- | --- | --- | --- |
+| `orderbook` | 38 | 1 | 1 (reference model, 512 random op sequences) |
+| `algo-core` | 58 | 5 | — |
+| `engine` | 21 | 1 | 18 (17 core scenarios, 1 end-to-end over gRPC) |
+| `api` | 5 | 1 | — |
+| `config` | 4 | — | — |
+| `python-bindings` | 2 | — | — |
+| `trader-gui` | 15 | — | — |
+| **Total** | **143** | **8** | **19** |
 
-**Papers**:
-- Almgren & Chriss (2000): "Optimal execution of portfolio transactions"
-- Bertsimas & Lo (1998): "Optimal control of execution costs"
+Plus 34 Python test functions, 67 cases after parametrisation.
 
-### Market Microstructure
-- Order book dynamics
-- Price discovery mechanisms
-- Liquidity provision
-- Market maker behavior
+The kinds of checking that matter more than the count:
 
-### Risk Management
-- Pre-trade risk controls
-- Post-trade analytics
-- Position limits and exposure management
-- Circuit breakers and kill switches
+- **A differential test against a naive model.** The order book is compared
+  operation by operation with an implementation written for obviousness rather
+  than speed.
+- **Property tests** for the invariants that should hold for every input: the
+  accounting identity, schedule totals and monotonicity, the POV participation
+  cap, prefix invariance, and first-order optimality of the Almgren–Chriss
+  trajectory.
+- **Known-answer tests** where a value can be derived independently: the first
+  output of `splitmix64.c`, a pinned randomized TWAP schedule, closed-form cost
+  and variance, and an exact round-trip P&L.
+- **Mutation testing.** Twenty deliberate single-line mutations — each one a
+  plausible mistake that the suite previously failed to notice, plus a revert of
+  each bug fixed in this pass — were applied and the suite was confirmed to fail
+  for every one. The mutants covered the randomized-TWAP draw, the multiply-shift
+  reduction, uneven slice widths, the monotonicity clamp, tie rounding, the VWAP
+  truncation and window boundaries, the small-`κ` and large-`κ` paths, and the
+  `η̃ > 0` precondition.
+- **An end-to-end test over a real socket**, covering submit, stream, status and
+  positions, and checking that a business rejection and a malformed request are
+  reported differently.
 
 ---
 
-## 🤝 Contributing
+## Benchmarks
 
-We welcome contributions! Here's how:
+Criterion, `bench` profile (release with LTO), on one developer machine —
+a single-threaded, in-process measurement of book operations, not an end-to-end
+latency figure. Reproduce with `cargo bench -p orderbook`.
 
-### Setup Development Environment
-```bash
-# Fork the repo
-git clone https://github.com/yourusername/QuantSystem.git
-cd QuantSystem
+| Benchmark | Levels per side | Time |
+| --- | --- | --- |
+| Insert a passive limit order, then cancel it | 10 | 69.5 ns |
+| Insert a passive limit order, then cancel it | 1 000 | 88.6 ns |
+| IOC takes the best ask, then a passive order restores the level | 10 | 131.9 ns |
+| IOC takes the best ask, then a passive order restores the level | 1 000 | 152.9 ns |
+| Read best bid and best ask | 1 000 | 4.6 ns |
+| 100 000 mixed operations | 100 | 11.1 ms, 9.0 M ops/s |
 
-# Create feature branch
-git checkout -b feature/amazing-feature
+The per-operation benchmarks restore the book to the same shape after every
+iteration, so the measured cost does not drift as the benchmark runs.
 
-# Make changes, add tests
-cargo test --all
+The mixed workload is generated against a shadow copy of the book, so every
+operation is one the book can really act on: cancels name an order that is still
+resting at that point in the stream, and each IOC is priced through the live
+touch so it actually trades. The add/cancel choice holds the resting count
+inside a band, and the benchmark asserts the book ends near the size it started
+at — otherwise the per-operation figure would be an average over a book that
+grew as the stream replayed. With seed 7 the realised stream is 48 250 passive
+limit orders, 36 830 cancels and 14 920 IOC orders producing 20 956 fills, with
+the resting count going from 800 to 899.
 
-# Commit with conventional commits
-git commit -m "feat: add amazing feature"
+---
 
-# Push and create PR
-git push origin feature/amazing-feature
+## Configuration
+
+`config/default.toml`, loaded by the engine. Unknown keys are rejected, so a
+misspelled setting fails loudly instead of falling back to a default, and every
+value is range-checked with the offending field named in the error.
+
+```toml
+[engine]
+tick_interval_ms = 50          # how often due children are released and quotes refreshed
+command_buffer = 1024
+fill_buffer = 4096             # how far a fill subscriber may fall behind
+retained_finished_orders = 10000
+
+[api]
+listen_addr = "127.0.0.1:50051"   # no authentication; keep it on loopback
+
+[risk]
+max_order_qty = 100000
+max_order_notional = 10000000.0
+max_position_qty = 500000
+max_gross_notional = 50000000.0
+price_collar_bps = 500
+max_loss = 250000.0            # total P&L at which trading halts
+
+[[venue.symbols]]              # the simulated market maker's ladder
+symbol = "BTC-USD"
+reference_price = 65000.0
+levels = 20
+qty_per_level = 5
+level_spacing_bps = 1
 ```
 
-### Code Standards
-- ✅ All code must pass `cargo clippy`
-- ✅ Format with `cargo fmt`
-- ✅ Add tests for new features (maintain >90% coverage)
-- ✅ Update documentation
-- ✅ No warnings in release builds
-
-### Areas for Contribution
-- 🎯 New execution algorithms (Iceberg TWAP, Adaptive POV)
-- 📊 Additional performance metrics
-- 🔌 New data feed integrations (IEX, Polygon, etc.)
-- 🎨 GUI enhancements
-- 📝 Documentation improvements
-- 🧪 More test coverage
+Three symbols are configured: `BTC-USD`, `ETH-USD` and `SIM-EQ`. Money amounts
+are given in price units and converted to integer ticks by the engine.
 
 ---
 
-## 📝 Recent Improvements (v2.0)
+## Limitations
 
-### Critical Fixes ✅
-- **FOK Order Bug**: Fixed data loss in Fill-or-Kill orders
-- **Position Overflow**: Added checked arithmetic to prevent silent integer overflow
-- **Thread Safety**: Made SmartRouter thread-safe for concurrent trading
-- **Race Conditions**: Prevented market maker double-seeding
-- **Depth Tracking**: Fixed orderbook depth not updating after partial fills
+Stated because they are the first things worth asking about:
 
-### Quality Improvements ✅
-- **Zero Warnings**: Eliminated all 24 build warnings
-- **Magic Numbers**: Extracted to named constants for maintainability
-- **Error Handling**: Comprehensive error types with `thiserror`
-- **Input Validation**: Added VWAP timestamp validation
-- **TWAP Jitter**: Fixed bounds to respect slice boundaries
-
-### Documentation ✅
-- **Module Docs**: Added comprehensive documentation to all crates
-- **API Examples**: Included usage examples in doc comments
-- **Risk Checks**: Documented all risk validation logic
-
-### New Features ✅
-- **Graceful Shutdown**: Background tasks clean up properly
-- **Unrealized P&L**: Real-time calculation using current market prices
-- **Post-Trade Risk**: Complete risk check implementation
-- **Stream Error Handling**: Client notification for lagged fill streams
-
-### Test Suite ✅
-- **98 Tests Passing**: All unit and integration tests pass
-- **Zero Failures**: Clean test run on all platforms
-- **Doc Tests**: All code examples in documentation are verified
+- The venue is simulated and its reference price never moves. Fills consume
+  depth; the next tick restores it. Execution cost measured here reflects the
+  scheduler walking a static book.
+- No exchange connectivity, no historical replay, no commissions or fees, no
+  borrow or financing costs, no partial-fill latency model, no queue-position
+  modelling beyond arrival order.
+- Self-trade prevention is not modelled: the book has no notion of order owners.
+- The gRPC API has no authentication, authorisation or TLS.
+- Nothing is persisted. Engine state lives in memory for the life of the
+  process.
+- POV is not exposed through the engine API, for the reason given above.
+- The loss kill switch halts new orders; it does not liquidate existing
+  positions.
+- Benchmarks are single-machine and in-process. No throughput claim is made for
+  the engine or the API as a whole, because none has been measured.
 
 ---
 
-## 📄 License
+## References
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-Built with:
-- **Rust** - Systems programming language
-- **egui** - Immediate mode GUI framework
-- **tokio** - Async runtime
-- **tonic** - gRPC framework
-- **PyO3** - Python bindings
-- **SQLite** - Embedded database
-
-Inspired by institutional trading systems at:
-- Jane Street
-- Citadel Securities
-- Two Sigma
-- Renaissance Technologies
+- Almgren, R. and Chriss, N. (2000). "Optimal execution of portfolio
+  transactions." *Journal of Risk* 3(2), 5–39. The implementation shortfall
+  scheduler follows the discrete linear-impact model from this paper.
+- Steele, G., Lea, D. and Flood, C. (2014). "Fast splittable pseudorandom number
+  generators." The `splitmix64` variant used for randomized TWAP release times.
 
 ---
 
-## 📞 Support
+## Licence
 
-- 📧 Email: support@quantsystem.dev
-- 💬 Discord: [Join our community](https://discord.gg/quantsystem)
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/QuantSystem/issues)
-- 📖 Docs: [Full Documentation](https://quantsystem.dev/docs)
-
----
-
-<p align="center">
-  <b>Built with ❤️ for traders who understand execution matters</b>
-</p>
-
-<p align="center">
-  <i>Because the best algorithm in the world is worthless with poor execution.</i>
-</p>
+MIT. See [LICENSE](LICENSE).
