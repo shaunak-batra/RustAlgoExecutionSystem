@@ -390,6 +390,9 @@ struct AppState {
     halt_reason: Arc<Mutex<Option<String>>>,
     fills: Arc<Mutex<VecDeque<FillRow>>>,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
+    /// Every parent order id the engine has accepted this session. The status
+    /// poll works from this list, so an id has to land here as soon as it exists.
+    tracked_orders: Arc<Mutex<Vec<u64>>>,
     client: Arc<Mutex<Option<ExecutionServiceClient<Channel>>>>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -408,6 +411,7 @@ impl AppState {
             halt_reason: Arc::new(Mutex::new(None)),
             fills: Arc::new(Mutex::new(VecDeque::new())),
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            tracked_orders: Arc::new(Mutex::new(Vec::new())),
             client: Arc::new(Mutex::new(None)),
             runtime: Arc::new(runtime),
         }
@@ -433,6 +437,14 @@ impl AppState {
 
     fn connected_client(&self) -> Option<ExecutionServiceClient<Channel>> {
         self.client.lock().unwrap().clone()
+    }
+
+    /// Records an accepted parent order id so the status poll picks it up.
+    fn track_order(&self, parent_order_id: u64) {
+        let mut tracked = self.tracked_orders.lock().unwrap();
+        if !tracked.contains(&parent_order_id) {
+            tracked.push(parent_order_id);
+        }
     }
 }
 
@@ -982,11 +994,24 @@ impl TraderApp {
                 Ok(response) => {
                     let response = response.into_inner();
                     if response.accepted {
-                        state.log(format!(
-                            "order #{} accepted: {summary}",
-                            response.parent_order_id
-                        ));
-                        state.set_status(format!("Order #{} working", response.parent_order_id));
+                        let id = response.parent_order_id;
+                        state.log(format!("order #{id} accepted: {summary}"));
+                        state.set_status(format!("Order #{id} working"));
+                        // Track the id first. The status poll works from this
+                        // list, so an order that is accepted but never tracked
+                        // would never be polled and would stay invisible.
+                        state.track_order(id);
+                        // Then read it back, so the table shows engine state now
+                        // rather than after the next poll.
+                        match runtime.block_on(client.get_order_status(OrderStatusRequest {
+                            parent_order_id: id,
+                        })) {
+                            Ok(status) => update_order(&state, status.into_inner()),
+                            Err(status) => state.log(format!(
+                                "order #{id} accepted, but reading its status failed: {}",
+                                status.message()
+                            )),
+                        }
                     } else {
                         // A business rejection, not a transport failure: the
                         // engine replies with the reason.
@@ -1069,21 +1094,19 @@ impl TraderApp {
         });
     }
 
-    /// Re-reads every order that is not in a terminal state, plus any order the
-    /// UI has not seen a status for yet.
+    /// Re-reads every tracked order that is not finished, including one the UI
+    /// holds no status for at all.
     fn refresh_working_orders(&self) {
         let Some(mut client) = self.state.connected_client() else {
             return;
         };
-        let ids: Vec<u64> = self
-            .state
-            .orders
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|order| !order.is_terminal())
-            .map(|order| order.parent_order_id)
-            .collect();
+        let ids = {
+            // tracked_orders before orders, which is the only order these two are
+            // ever taken in.
+            let tracked = self.state.tracked_orders.lock().unwrap();
+            let orders = self.state.orders.lock().unwrap();
+            ids_to_poll(&tracked, &orders)
+        };
         if ids.is_empty() {
             return;
         }
@@ -1103,6 +1126,23 @@ impl TraderApp {
             }
         });
     }
+}
+
+/// Which tracked orders still need a status read: those with no row yet, and
+/// those whose last known state was not terminal. An accepted order the UI has
+/// never seen has to be polled, or it would never appear at all.
+fn ids_to_poll(tracked: &[u64], orders: &[OrderRow]) -> Vec<u64> {
+    tracked
+        .iter()
+        .copied()
+        .filter(
+            |id| match orders.iter().find(|order| order.parent_order_id == *id) {
+                Some(order) => !order.is_terminal(),
+                // Accepted, but no status reply has landed yet.
+                None => true,
+            },
+        )
+        .collect()
 }
 
 /// Stores a status reply, replacing any earlier copy of the same order.
@@ -1378,6 +1418,59 @@ mod tests {
         assert_eq!(format_clock(0), "00:00:00");
         assert_eq!(format_clock(3_661 * 1_000_000_000), "01:01:01");
         assert_eq!(format_clock(86_400 * 1_000_000_000), "00:00:00");
+    }
+
+    fn row(parent_order_id: u64, order_state: &str) -> OrderRow {
+        OrderRow {
+            parent_order_id,
+            symbol: "BTC-USD".to_string(),
+            side: "BUY".to_string(),
+            algorithm: "TWAP".to_string(),
+            state: order_state.to_string(),
+            state_reason: String::new(),
+            quantity: 100,
+            filled_quantity: 0,
+            limit_price: None,
+            arrival_mid: 0.0,
+            average_fill_price: None,
+            shortfall_bps: None,
+            pending_slices: 0,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_accepted_order_is_polled_before_any_status_has_arrived() {
+        // The bug this pins: submitting recorded nothing, and the poll took its
+        // ids from the orders table, so an accepted order was never polled and
+        // never showed up in the UI at all.
+        assert_eq!(ids_to_poll(&[7], &[]), vec![7]);
+    }
+
+    #[test]
+    fn polling_stops_once_an_order_is_finished() {
+        assert_eq!(ids_to_poll(&[7], &[row(7, "WORKING")]), vec![7]);
+        for finished in ["FILLED", "CANCELLED", "EXPIRED"] {
+            assert!(
+                ids_to_poll(&[7], &[row(7, finished)]).is_empty(),
+                "{finished} should not be polled again"
+            );
+        }
+    }
+
+    #[test]
+    fn polling_covers_every_unfinished_tracked_order_once() {
+        let orders = [row(1, "FILLED"), row(2, "WORKING")];
+        assert_eq!(ids_to_poll(&[1, 2, 3], &orders), vec![2, 3]);
+    }
+
+    #[test]
+    fn tracking_the_same_order_twice_keeps_one_entry() {
+        let state = AppState::new();
+        state.track_order(5);
+        state.track_order(5);
+        state.track_order(6);
+        assert_eq!(*state.tracked_orders.lock().unwrap(), vec![5, 6]);
     }
 
     #[test]
