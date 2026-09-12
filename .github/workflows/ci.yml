@@ -50,8 +50,14 @@ jobs:
         run: cargo test --workspace --release
 
   python:
-    name: Python bindings
+    name: Python bindings (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest CPython the bindings support. PyO3 0.22 caps at 3.13,
+        # which is why pyproject.toml sets requires-python = ">=3.9,<3.14".
+        python-version: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +65,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - uses: Swatinem/rust-cache@v2
 

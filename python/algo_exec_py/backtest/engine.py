@@ -19,11 +19,17 @@ class BacktestEngine:
         """
         Args:
             price_path: ``(timestamp_ns, price)`` observations, in any order.
+                Timestamps must be unique. Two prices at one timestamp leave the
+                interpolation undefined, and because the sort is stable, which of
+                them won would depend on the order they were passed in, making
+                "in any order" untrue. Aggregate them before passing them in.
         """
         if not price_path:
             raise ValueError("price_path must not be empty")
         self.price_path = sorted(price_path, key=lambda point: point[0])
         self._times = [time_ns for time_ns, _ in self.price_path]
+        if len(set(self._times)) != len(self._times):
+            raise ValueError("price_path timestamps must be unique")
         self.fills: List[Dict[str, Any]] = []
         self.side = "BUY"
         self.arrival_price: Optional[float] = None

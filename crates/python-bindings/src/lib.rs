@@ -1,7 +1,10 @@
 //! Python bindings for the execution algorithms, installed as `algo_exec_py._native`.
 //!
-//! Every function validates its input in Rust; invalid input raises
-//! `ValueError` carrying the Rust error message.
+//! Arguments are converted to Rust types before any scheduler runs, so which
+//! exception a caller sees depends on how the input is wrong: the wrong type
+//! raises `TypeError`, an integer outside its parameter's range (a negative
+//! quantity, say) raises `OverflowError`, and a value the scheduler itself
+//! rejects raises `ValueError` carrying the Rust error message.
 
 // `#[pyfunction]` in pyo3 0.22 expands to a `PyErr -> PyErr` conversion that clippy flags.
 #![allow(clippy::useless_conversion)]
@@ -84,7 +87,8 @@ fn vwap_schedule(
         .map_err(value_error)
 }
 
-/// Intraday volume profile (fractions summing to 1) from `(timestamp_ns, volume)` bars.
+/// Intraday volume profile from `(timestamp_ns, volume)` bars: one fraction per
+/// slice, summing to 1 up to floating-point rounding.
 #[pyfunction]
 #[pyo3(signature = (bars, start_offset_ns, duration_ns, num_slices, day_ns = IntradayWindow::NANOS_PER_DAY))]
 fn volume_profile_from_bars(
@@ -161,7 +165,8 @@ fn almgren_chriss_schedule<'py>(
     Ok(result)
 }
 
-/// Converts a price to integer ticks, rounding to the nearest tick.
+/// Converts a price to integer ticks, rounding `price * TICK_SCALE` half away
+/// from zero. Exact for prices with at most five decimals.
 #[pyfunction]
 fn price_to_ticks(price: f64) -> PyResult<i64> {
     Price::try_from_f64(price)

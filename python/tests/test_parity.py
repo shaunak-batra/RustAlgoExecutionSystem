@@ -11,6 +11,7 @@ suite fails instead of silently skipping.
 """
 
 import math
+import sys
 
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -34,6 +35,32 @@ def reference_twap_quantities(total, n):
 
 def reference_slice_starts(start, end, n):
     return [start + (end - start) * k // n for k in range(n)]
+
+
+MASK64 = (1 << 64) - 1
+
+
+def reference_splitmix64(seed):
+    """The splitmix64.c generator used by ``twap_schedule_randomized``."""
+    state = seed & MASK64
+    while True:
+        state = (state + 0x9E3779B97F4A7C15) & MASK64
+        z = state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        yield (z ^ (z >> 31)) & MASK64
+
+
+def reference_randomized_twap(start, end, total, n, seed):
+    """Slice starts plus a multiply-shift draw per slice, including empty slices."""
+    draws = reference_splitmix64(seed)
+    bounds = reference_slice_starts(start, end, n) + [end]
+    schedule = []
+    for k, qty in enumerate(reference_twap_quantities(total, n)):
+        offset = (next(draws) * (bounds[k + 1] - bounds[k])) >> 64
+        if qty > 0:
+            schedule.append((bounds[k] + offset, qty))
+    return schedule
 
 
 class TestTwap:
@@ -85,6 +112,26 @@ class TestTwap:
         with pytest.raises(ValueError):
             ae.twap_schedule(*args)
 
+    def test_splitmix64_reference_matches_the_published_first_output(self):
+        assert next(reference_splitmix64(0)) == 0xE220A8397B1DCDAF
+
+    @pytest.mark.parametrize("total, n", [(5, 7), (100, 7), (1000, 10), (3, 64)])
+    def test_randomized_matches_an_independent_generator(self, total, n):
+        # 10_000 ns over 7 slices does not divide evenly, so the slice widths the
+        # draws are scaled by differ.
+        start, end, seed = 1_000, 11_000, 42
+        assert ae.twap_schedule_randomized(start, end, total, n, seed) == (
+            reference_randomized_twap(start, end, total, n, seed)
+        )
+
+    def test_randomized_slice_times_do_not_depend_on_the_quantity(self):
+        # One draw per slice, so a slice that rounds to zero still consumes its
+        # draw and the slices that do trade keep their times.
+        sparse = ae.twap_schedule_randomized(1_000, 11_000, 5, 7, 42)
+        dense = ae.twap_schedule_randomized(1_000, 11_000, 100, 7, 42)
+        assert [time_ns for time_ns, _ in sparse] == [2_058, 4_254, 5_776, 6_768, 9_883]
+        assert {t for t, _ in sparse} <= {t for t, _ in dense}
+
     def test_randomized_times_stay_in_their_slices(self):
         start, end, n = SECOND, 11 * SECOND, 10
         schedule = ae.twap_schedule_randomized(start, end, 1000, n, 42)
@@ -125,7 +172,11 @@ class TestVwap:
                 assert k not in by_slice
             done += by_slice.get(k, 0)
             running += weight
-            assert abs(done - total * running / weight_total) <= 0.5 + 1e-9 * total
+            # Half a unit, plus the error of the profile's own float sums, which
+            # grows with the slice count. A slack of 1e-9 * total would allow
+            # 1000 units at the largest sizes and hide a real violation.
+            slack = 0.5 + 4.0 * len(profile) * sys.float_info.epsilon * total
+            assert abs(done - total * running / weight_total) <= slack
 
     @pytest.mark.parametrize(
         "profile", [[], [0.0, 0.0], [1.0, -1.0], [1.0, float("nan")], [float("inf")]]
@@ -159,25 +210,50 @@ class TestPov:
     @given(
         bps=st.integers(1, 10_000),
         total=st.integers(1, 10**9),
-        volumes=st.lists(st.integers(0, 10**9), max_size=40),
+        # A gap of zero repeats a timestamp, which the schedule merges into one
+        # child; small volumes produce increments that round to nothing.
+        observations=st.lists(
+            st.tuples(st.integers(0, 2), st.integers(0, 10**9)), max_size=40
+        ),
     )
-    def test_cap_completeness_and_causality(self, bps, total, volumes):
-        data = list(enumerate(volumes))
+    def test_cap_completeness_and_prefix_invariance(self, bps, total, observations):
+        data, timestamp = [], 0
+        for gap, volume in observations:
+            timestamp += gap
+            data.append((timestamp, volume))
         full = ae.pov_schedule(0, 10**6, total, bps, data)
-        children = dict(full["children"])
+        children = full["children"]
 
-        cumulative_volume, done = 0, 0
-        for time_ns, volume in data:
+        # Every child is a real order, and together they are scheduled_qty. Read
+        # the list rather than a dict: a dict would hide a duplicate timestamp.
+        assert all(qty > 0 for _, qty in children)
+        assert [t for t, _ in children] == sorted({t for t, _ in children})
+        assert sum(qty for _, qty in children) == full["scheduled_qty"]
+
+        cumulative_volume, done, index = 0, 0, 0
+        for i, (time_ns, volume) in enumerate(data):
             cumulative_volume += volume
-            done += children.get(time_ns, 0)
+            # Observations sharing a timestamp are one decision point.
+            if i + 1 < len(data) and data[i + 1][0] == time_ns:
+                continue
+            if index < len(children) and children[index][0] == time_ns:
+                done += children[index][1]
+                index += 1
             assert done * 10_000 <= cumulative_volume * bps
 
-        assert full["scheduled_qty"] == min(total, sum(volumes) * bps // 10_000)
+        assert full["scheduled_qty"] == min(
+            total, sum(v for _, v in data) * bps // 10_000
+        )
         assert full["scheduled_qty"] + full["shortfall_qty"] == total
 
+        # Once every observation at a timestamp has been seen, that timestamp's
+        # child is settled and later data cannot change it.
         for cut in range(len(data) + 1):
             prefix = ae.pov_schedule(0, 10**6, total, bps, data[:cut])
-            assert prefix["children"] == [c for c in full["children"] if c[0] < cut]
+            boundary = data[cut][0] if cut < len(data) else math.inf
+            assert [c for c in prefix["children"] if c[0] < boundary] == [
+                c for c in children if c[0] < boundary
+            ]
 
     @pytest.mark.parametrize(
         "bps, data",
@@ -222,9 +298,27 @@ class TestAlmgrenChriss:
         assert result["holdings"] == pytest.approx(holdings, rel=1e-9, abs=1e-6)
         assert sum(qty for _, qty in result["children"]) == 100_000
 
-    def test_risk_neutral_schedule_is_twap(self):
-        result = ae.almgren_chriss_schedule(risk_aversion=0.0, **self.PARAMS)
-        assert result["children"] == ae.twap_schedule(0, 3_600 * SECOND, 100_000, 12)
+    @pytest.mark.parametrize("total, n", [(100_000, 12), (9, 6), (15, 6), (3, 4), (1, 7)])
+    def test_risk_neutral_schedule_is_twap(self, total, n):
+        # 9 units over 6 slices is one of the sizes where rounding the float
+        # trajectory gave 1,2,2,1,2,1 instead of TWAP's 2,1,2,1,2,1.
+        params = dict(self.PARAMS, total_qty=total, num_slices=n)
+        result = ae.almgren_chriss_schedule(risk_aversion=0.0, **params)
+        assert result["children"] == ae.twap_schedule(
+            params["start_ns"], params["end_ns"], total, n
+        )
+
+    def test_tiny_risk_aversion_keeps_kappa_positive(self):
+        result = ae.almgren_chriss_schedule(risk_aversion=1e-20, **self.PARAMS)
+        assert 0.0 < result["kappa"] < 1e-9
+
+        # Why reference_almgren_chriss is not used here: at this size 1 + y is
+        # exactly 1.0, so acosh(1 + y) collapses to zero. The Rust code keeps the
+        # sqrt(2y) behaviour by computing ln1p(y + sqrt(y(y + 2))).
+        tau = 3_600.0 / 12
+        eta_tilde = 0.5 - 0.5 * 1e-6 * tau
+        y = 0.5 * (1e-20 * 0.02**2 / eta_tilde) * tau * tau
+        assert math.acosh(1.0 + y) == 0.0
 
     def test_cost_and_variance_formulas(self):
         result = ae.almgren_chriss_schedule(risk_aversion=1e-3, **self.PARAMS)
@@ -270,6 +364,52 @@ class TestPricesAndMetadata:
         assert isinstance(_native.__version__, str)
 
 
+class TestArgumentErrors:
+    """Which exception a bad argument raises depends on how it is wrong.
+
+    Arguments are converted to Rust types before any scheduler runs, so a value
+    that cannot be converted never reaches the validation that raises
+    ``ValueError``.
+    """
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda: ae.twap_schedule(0, SECOND, -5, 5),
+            lambda: ae.twap_schedule(0, SECOND, 100, -1),
+            lambda: ae.twap_schedule(0, SECOND, 2**64, 5),
+            lambda: ae.pov_schedule(0, 10, 100, -1, [(1, 10)]),
+            lambda: ae.pov_schedule(0, 10, 100, 100, [(1, -10)]),
+        ],
+    )
+    def test_integers_outside_their_range_raise_overflow_error(self, call):
+        with pytest.raises(OverflowError):
+            call()
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda: ae.twap_schedule(0, SECOND, 100.5, 5),
+            lambda: ae.twap_schedule(0, SECOND, "100", 5),
+            lambda: ae.pov_schedule(0, 10, 100, 1.5, [(1, 10)]),
+            lambda: ae.price_to_ticks("x"),
+            lambda: ae.vwap_schedule(0, SECOND, 100, ["a"]),
+        ],
+    )
+    def test_wrong_types_raise_type_error(self, call):
+        with pytest.raises(TypeError):
+            call()
+
+    def test_values_the_scheduler_rejects_raise_value_error(self):
+        # Convertible and in range, so Rust validation is what rejects these.
+        with pytest.raises(ValueError, match="participation_bps"):
+            ae.pov_schedule(0, 10, 100, 0, [(1, 10)])
+        with pytest.raises(ValueError, match="participation_bps"):
+            ae.pov_schedule(0, 10, 100, 10_001, [(1, 10)])
+        with pytest.raises(ValueError, match="quantity"):
+            ae.twap_schedule(0, SECOND, 0, 5)
+
+
 class TestBacktestHarness:
     PATH = [(i * SECOND, 100.0 + i) for i in range(11)]  # +1.0 per second
 
@@ -293,6 +433,20 @@ class TestBacktestHarness:
         assert engine.price_at(SECOND // 2) == pytest.approx(100.5)
         assert engine.price_at(-5) == 100.0
         assert engine.price_at(99 * SECOND) == 110.0
+
+    def test_metrics_do_not_depend_on_the_input_order(self):
+        def metrics(path):
+            engine = BacktestEngine(path)
+            engine.run_twap(0, 10 * SECOND, 1000, 10, side="BUY")
+            return engine.calculate_metrics()
+
+        assert metrics(list(reversed(self.PATH))) == metrics(self.PATH)
+
+    def test_duplicate_timestamps_are_rejected(self):
+        # Two prices at one timestamp would make the result depend on which of
+        # them came first in the input.
+        with pytest.raises(ValueError, match="unique"):
+            BacktestEngine(self.PATH + [(5 * SECOND, 999.0)])
 
     def test_rejects_empty_path_and_unknown_side(self):
         with pytest.raises(ValueError):

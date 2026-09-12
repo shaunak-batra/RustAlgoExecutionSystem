@@ -4,7 +4,10 @@
   its functions are re-exported here
 - ``algo_exec_py.backtest``: a small execution-backtest harness built on them
 
-Invalid arguments raise ``ValueError`` carrying the Rust error message.
+Which exception a bad argument raises depends on how it is wrong: the wrong type
+raises ``TypeError``, an integer outside its parameter's range (a negative
+quantity, say) raises ``OverflowError``, and a value the scheduler rejects raises
+``ValueError`` carrying the Rust error message.
 """
 
 from ._native import (

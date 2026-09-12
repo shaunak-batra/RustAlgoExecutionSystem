@@ -6,7 +6,10 @@ build-backend = "maturin"
 name = "algo-exec-py"
 version = "0.1.0"
 description = "Python bindings (PyO3) for the Rust execution-algorithm library"
-requires-python = ">=3.9"
+# PyO3 0.22 supports CPython 3.13 at the newest, so cap the range here. Without
+# the cap, pip on a newer interpreter starts the build and fails in the compiler
+# instead of reporting an incompatible requirement.
+requires-python = ">=3.9,<3.14"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
