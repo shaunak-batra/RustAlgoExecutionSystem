@@ -1,9 +1,16 @@
 //! Desktop client for the execution engine.
 //!
-//! Every value on screen comes from the engine over gRPC: parent order state,
-//! child orders, fills, positions, and whether risk has halted trading. This
-//! process holds no market data source of its own and simulates nothing, so
-//! anything displayed can be traced back to an engine reply.
+//! Every order, position and fill value shown comes from an engine reply over
+//! gRPC: parent order state, child orders, positions, fills and whether risk has
+//! halted trading. This process holds no market data of its own and simulates
+//! nothing. The few values that are local are labelled as such: the quick-fill
+//! symbol buttons, the form defaults, and log times from this machine's clock.
+//!
+//! Each connection is a session. Connecting or disconnecting starts a new one:
+//! everything the previous session showed is cleared, and replies that arrive
+//! late from the old connection are discarded. An engine restart is noticed when
+//! requests start failing; the client does not try to tell a restarted engine
+//! from the same one, so reconnect after restarting the engine.
 //!
 //! POV is deliberately absent. The order API offers TWAP, VWAP and
 //! implementation shortfall; [`algo_core::pov`] exists and is tested, but the
@@ -20,16 +27,29 @@ use api::proto::{
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use orderbook::{Price, Side};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tonic::transport::Channel;
+use tokio::sync::watch;
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Response, Status};
 
 /// Symbols in the shipped `config/default.toml`, offered as quick fills. The API
-/// has no "list symbols" call, and `GetPositions` only reports symbols that have
-/// traded, so these are a convenience rather than a source of truth.
+/// has no "list symbols" call, and `GetPositions` only reports symbols the engine
+/// has sent a child order for, so these are a convenience, not a source of truth.
 const DEFAULT_SYMBOLS: [&str; 3] = ["BTC-USD", "ETH-USD", "SIM-EQ"];
+
+/// How long to wait for the engine to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Deadline for every unary request, so a stalled engine cannot pile up threads.
+const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fills kept for display.
+const MAX_FILLS: usize = 500;
+/// Log lines kept for display.
+const MAX_LOG_ENTRIES: usize = 500;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -180,6 +200,7 @@ fn format_shortfall(bps: Option<f64>) -> String {
     }
 }
 
+/// UTC time of day as HH:MM:SS.
 fn format_clock(timestamp_ns: u64) -> String {
     let seconds = timestamp_ns / 1_000_000_000 % 86_400;
     format!(
@@ -210,7 +231,8 @@ impl AlgoChoice {
         match self {
             AlgoChoice::Twap => {
                 "Equal quantities per time slice, to within one unit. Slice k is \
-                 released at start + k x duration / slices."
+                 scheduled for start + k x duration / slices and sent on the next \
+                 engine tick; quantity a child could not fill is carried into the next."
             }
             AlgoChoice::Vwap => {
                 "Quantities in proportion to the volume profile below: one weight \
@@ -270,6 +292,9 @@ impl OrderForm {
         let quantity = parse_quantity(&self.quantity)?;
         let limit_price_ticks = parse_limit_price(&self.limit_price)?;
         let duration_ns = parse_duration_secs(&self.duration_secs)?;
+        let end_time_ns = start_ns
+            .checked_add(duration_ns)
+            .ok_or_else(|| "duration is too long".to_string())?;
 
         let algorithm = match self.algo {
             AlgoChoice::Twap => Algorithm::Twap(TwapParams {
@@ -301,7 +326,7 @@ impl OrderForm {
             quantity,
             limit_price_ticks,
             start_time_ns: start_ns,
-            end_time_ns: start_ns + duration_ns,
+            end_time_ns,
             algorithm: Some(algorithm),
         })
     }
@@ -332,6 +357,8 @@ struct OrderRow {
     quantity: u64,
     filled_quantity: u64,
     limit_price: Option<f64>,
+    start_time_ns: u64,
+    end_time_ns: u64,
     arrival_mid: f64,
     average_fill_price: Option<f64>,
     shortfall_bps: Option<f64>,
@@ -371,7 +398,53 @@ enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected,
+    /// A client exists but requests to the engine are failing.
+    Unreachable(String),
+    /// The connection attempt itself failed.
     Error(String),
+}
+
+impl ConnectionStatus {
+    /// Whether a client exists, so polling should continue.
+    fn has_client(&self) -> bool {
+        matches!(
+            self,
+            ConnectionStatus::Connected | ConnectionStatus::Unreachable(_)
+        )
+    }
+
+    /// Whether the Connect button should be offered.
+    fn can_connect(&self) -> bool {
+        !matches!(
+            self,
+            ConnectionStatus::Connected | ConnectionStatus::Connecting
+        )
+    }
+}
+
+/// Whether a failed request says the engine could not be reached, as opposed to
+/// the engine answering with an error.
+fn is_unreachable(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Unknown
+    )
+}
+
+/// The connection indicator after a request finishes. Only reachability failures
+/// move it to `Unreachable`, and the next request that gets any reply moves it
+/// back to `Connected`. A rejection or NOT_FOUND is a reply, so it counts as
+/// reachable.
+fn status_after_reply(current: &ConnectionStatus, failure: Option<&Status>) -> ConnectionStatus {
+    match (current, failure) {
+        (ConnectionStatus::Connected | ConnectionStatus::Unreachable(_), Some(status))
+            if is_unreachable(status) =>
+        {
+            ConnectionStatus::Unreachable(status.message().to_string())
+        }
+        (ConnectionStatus::Unreachable(_), _) => ConnectionStatus::Connected,
+        (current, _) => current.clone(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -380,20 +453,47 @@ struct LogEntry {
     message: String,
 }
 
+/// Clears a "request in flight" flag when the worker holding it finishes, on
+/// every exit path.
+struct InFlight(Arc<AtomicBool>);
+
+impl InFlight {
+    /// Claims the flag, or returns `None` if a request of this kind is running.
+    fn claim(flag: &Arc<AtomicBool>) -> Option<Self> {
+        (!flag.swap(true, Ordering::SeqCst)).then(|| Self(flag.clone()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     status: Arc<Mutex<String>>,
     connection: Arc<Mutex<ConnectionStatus>>,
     orders: Arc<Mutex<Vec<OrderRow>>>,
     positions: Arc<Mutex<Vec<PositionRow>>>,
-    /// `Some(reason)` when the engine has halted trading on its loss limit.
+    /// `Some(reason)` when the engine has halted trading.
     halt_reason: Arc<Mutex<Option<String>>>,
     fills: Arc<Mutex<VecDeque<FillRow>>>,
+    /// What the fill stream is doing, shown on the Fills page.
+    stream_status: Arc<Mutex<String>>,
     logs: Arc<Mutex<VecDeque<LogEntry>>>,
     /// Every parent order id the engine has accepted this session. The status
     /// poll works from this list, so an id has to land here as soon as it exists.
     tracked_orders: Arc<Mutex<Vec<u64>>>,
     client: Arc<Mutex<Option<ExecutionServiceClient<Channel>>>>,
+    /// Session counter, bumped on every connect and disconnect. Background work
+    /// remembers the value it started under, and before writing any result it
+    /// checks, while holding the lock it writes under, that the value is still
+    /// current. A watch channel rather than an atomic so the fill stream can
+    /// also wait for the change and stop promptly.
+    generation: Arc<watch::Sender<u64>>,
+    positions_poll: Arc<AtomicBool>,
+    orders_poll: Arc<AtomicBool>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -403,6 +503,7 @@ impl AppState {
             .enable_all()
             .build()
             .expect("tokio runtime");
+        let (generation, _) = watch::channel(0);
         Self {
             status: Arc::new(Mutex::new("Not connected".to_string())),
             connection: Arc::new(Mutex::new(ConnectionStatus::Disconnected)),
@@ -410,11 +511,40 @@ impl AppState {
             positions: Arc::new(Mutex::new(Vec::new())),
             halt_reason: Arc::new(Mutex::new(None)),
             fills: Arc::new(Mutex::new(VecDeque::new())),
+            stream_status: Arc::new(Mutex::new("not subscribed".to_string())),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             tracked_orders: Arc::new(Mutex::new(Vec::new())),
             client: Arc::new(Mutex::new(None)),
+            generation: Arc::new(generation),
+            positions_poll: Arc::new(AtomicBool::new(false)),
+            orders_poll: Arc::new(AtomicBool::new(false)),
             runtime: Arc::new(runtime),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        *self.generation.borrow()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation() == generation
+    }
+
+    /// Starts a new session: bumps the generation first, then forgets the client
+    /// and everything the previous session reported. Bumping before clearing is
+    /// what makes a late writer either see the new generation and give up, or
+    /// finish before the clear and be wiped by it.
+    fn begin_session(&self) -> u64 {
+        self.generation.send_modify(|generation| *generation += 1);
+        let generation = self.generation();
+        *self.client.lock().unwrap() = None;
+        self.tracked_orders.lock().unwrap().clear();
+        self.orders.lock().unwrap().clear();
+        self.positions.lock().unwrap().clear();
+        self.fills.lock().unwrap().clear();
+        *self.halt_reason.lock().unwrap() = None;
+        *self.stream_status.lock().unwrap() = "not subscribed".to_string();
+        generation
     }
 
     fn log(&self, message: impl Into<String>) {
@@ -425,7 +555,7 @@ impl AppState {
         };
         let mut logs = self.logs.lock().unwrap();
         logs.push_back(entry);
-        while logs.len() > 500 {
+        while logs.len() > MAX_LOG_ENTRIES {
             logs.pop_front();
         }
         eprintln!("[gui] {message}");
@@ -435,17 +565,58 @@ impl AppState {
         *self.status.lock().unwrap() = message.into();
     }
 
+    fn set_stream_status(&self, generation: u64, message: impl Into<String>) {
+        let mut stream_status = self.stream_status.lock().unwrap();
+        if self.is_current(generation) {
+            *stream_status = message.into();
+        }
+    }
+
     fn connected_client(&self) -> Option<ExecutionServiceClient<Channel>> {
         self.client.lock().unwrap().clone()
     }
 
     /// Records an accepted parent order id so the status poll picks it up.
-    fn track_order(&self, parent_order_id: u64) {
+    fn track_order(&self, generation: u64, parent_order_id: u64) {
         let mut tracked = self.tracked_orders.lock().unwrap();
-        if !tracked.contains(&parent_order_id) {
+        if self.is_current(generation) && !tracked.contains(&parent_order_id) {
             tracked.push(parent_order_id);
         }
     }
+
+    /// Updates the connection indicator after a request, and logs a change.
+    fn record_reply(&self, generation: u64, failure: Option<&Status>) {
+        let mut connection = self.connection.lock().unwrap();
+        if !self.is_current(generation) {
+            return;
+        }
+        let next = status_after_reply(&connection, failure);
+        if next != *connection {
+            let message = match &next {
+                ConnectionStatus::Unreachable(reason) => format!("engine unreachable: {reason}"),
+                _ => "engine reachable again".to_string(),
+            };
+            *connection = next;
+            drop(connection);
+            self.log(message);
+        }
+    }
+}
+
+/// Runs a unary request with a deadline. The error is boxed because `Status`
+/// is large and every successful reply would otherwise pay for its size.
+fn call<T>(
+    runtime: &tokio::runtime::Runtime,
+    request: impl Future<Output = Result<Response<T>, Status>>,
+) -> Result<T, Box<Status>> {
+    runtime.block_on(async {
+        match tokio::time::timeout(RPC_TIMEOUT, request).await {
+            Ok(result) => result.map(Response::into_inner).map_err(Box::new),
+            Err(_) => Err(Box::new(Status::deadline_exceeded(
+                "the engine did not reply in time",
+            ))),
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +644,7 @@ struct TraderApp {
     form: OrderForm,
     last_error: Option<String>,
     selected_order: Option<u64>,
+    fill_symbol: Option<String>,
     state: AppState,
     last_poll_secs: f64,
 }
@@ -486,6 +658,7 @@ impl Default for TraderApp {
             form: OrderForm::default(),
             last_error: None,
             selected_order: None,
+            fill_symbol: None,
             state: AppState::new(),
             last_poll_secs: 0.0,
         }
@@ -499,7 +672,7 @@ impl eframe::App for TraderApp {
 
         let now_secs = now_ns() as f64 / 1e9;
         if now_secs - self.last_poll_secs > 0.5
-            && *self.state.connection.lock().unwrap() == ConnectionStatus::Connected
+            && self.state.connection.lock().unwrap().has_client()
         {
             self.last_poll_secs = now_secs;
             self.refresh_positions();
@@ -532,6 +705,10 @@ impl eframe::App for TraderApp {
                     ConnectionStatus::Disconnected => {
                         (egui::Color32::GRAY, "not connected".to_string())
                     }
+                    ConnectionStatus::Unreachable(reason) => (
+                        egui::Color32::from_rgb(255, 165, 0),
+                        format!("engine unreachable: {reason}"),
+                    ),
                     ConnectionStatus::Error(error) => (egui::Color32::RED, error.clone()),
                 };
                 ui.colored_label(colour, format!("● {text}"));
@@ -667,7 +844,7 @@ impl TraderApp {
                     }
                     if !connected {
                         ui.label(
-                            egui::RichText::new("connect to the engine first")
+                            egui::RichText::new("connect to a reachable engine first")
                                 .small()
                                 .italics(),
                         );
@@ -680,11 +857,11 @@ impl TraderApp {
             });
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("Parent orders").strong());
+            ui.label(egui::RichText::new("Parent orders this session").strong());
 
             let orders = self.state.orders.lock().unwrap().clone();
             if orders.is_empty() {
-                ui.label("No orders submitted yet.");
+                ui.label("No orders submitted in this session yet.");
                 return;
             }
 
@@ -752,6 +929,11 @@ impl TraderApp {
                     if !order.state_reason.is_empty() {
                         ui.label(format!("reason: {}", order.state_reason));
                     }
+                    ui.label(format!(
+                        "window {} to {} UTC",
+                        format_clock(order.start_time_ns),
+                        format_clock(order.end_time_ns)
+                    ));
                     ui.label(match order.limit_price {
                         Some(price) => format!("limit {price:.5}"),
                         None => "market child orders".to_string(),
@@ -769,7 +951,7 @@ impl TraderApp {
                         .num_columns(4)
                         .spacing([14.0, 4.0])
                         .show(ui, |ui| {
-                            for header in ["child", "sent", "quantity", "filled"] {
+                            for header in ["child", "sent (UTC)", "quantity", "filled"] {
                                 ui.strong(header);
                             }
                             ui.end_row();
@@ -800,7 +982,7 @@ impl TraderApp {
 
         let positions = self.state.positions.lock().unwrap().clone();
         if positions.is_empty() {
-            ui.label("No positions. They appear once an order fills.");
+            ui.label("No positions yet. A symbol appears once one of its orders has had a fill.");
             return;
         }
 
@@ -858,12 +1040,18 @@ impl TraderApp {
         ui.label(egui::RichText::new("Fills").strong());
         ui.label(
             egui::RichText::new(
-                "Streamed from the engine. If the stream falls behind it ends with \
-                 DATA_LOSS and says so, rather than dropping fills silently.",
+                "Every fill the engine executes while this session is subscribed, \
+                 including fills of orders placed by other clients. Fills that happen \
+                 while the stream is down are not replayed, so this list can have gaps; \
+                 order status and positions are unaffected.",
             )
             .small()
             .italics(),
         );
+        ui.label(format!(
+            "stream: {}",
+            self.state.stream_status.lock().unwrap()
+        ));
         ui.add_space(6.0);
 
         let fills: Vec<FillRow> = self.state.fills.lock().unwrap().iter().cloned().collect();
@@ -872,19 +1060,43 @@ impl TraderApp {
             return;
         }
 
-        let points: PlotPoints = fills
-            .iter()
-            .enumerate()
-            .map(|(index, fill)| [index as f64, fill.price])
-            .collect();
-        Plot::new("fill_prices")
-            .height(160.0)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .allow_scroll(false)
-            .show(ui, |plot_ui| {
-                plot_ui.line(Line::new(points).name("fill price"));
-            });
+        let series = fill_series(&fills);
+        if self
+            .fill_symbol
+            .as_ref()
+            .is_none_or(|symbol| !series.contains_key(symbol))
+        {
+            self.fill_symbol = fills.last().map(|fill| fill.symbol.clone());
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("symbol plotted")
+                .selected_text(self.fill_symbol.clone().unwrap_or_default())
+                .show_ui(ui, |ui| {
+                    for symbol in series.keys() {
+                        ui.selectable_value(&mut self.fill_symbol, Some(symbol.clone()), symbol);
+                    }
+                });
+            ui.label(
+                egui::RichText::new("x axis: seconds since the first fill shown")
+                    .small()
+                    .italics(),
+            );
+        });
+        if let Some(points) = self
+            .fill_symbol
+            .as_ref()
+            .and_then(|symbol| series.get(symbol))
+        {
+            let points = PlotPoints::from(points.clone());
+            Plot::new("fill_prices")
+                .height(160.0)
+                .allow_drag(false)
+                .allow_zoom(false)
+                .allow_scroll(false)
+                .show(ui, |plot_ui| {
+                    plot_ui.line(Line::new(points).name("fill price"));
+                });
+        }
 
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -893,7 +1105,14 @@ impl TraderApp {
                 .num_columns(6)
                 .spacing([16.0, 4.0])
                 .show(ui, |ui| {
-                    for header in ["time", "parent", "child", "symbol", "side", "price x qty"] {
+                    for header in [
+                        "time (UTC)",
+                        "parent",
+                        "child",
+                        "symbol",
+                        "side",
+                        "price x qty",
+                    ] {
                         ui.strong(header);
                     }
                     ui.end_row();
@@ -912,23 +1131,34 @@ impl TraderApp {
 
     fn render_connection(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Engine connection").strong());
+        let connection = self.state.connection.lock().unwrap().clone();
         ui.horizontal(|ui| {
             ui.label("Address");
-            ui.text_edit_singleline(&mut self.server_address);
+            ui.add_enabled(
+                connection.can_connect(),
+                egui::TextEdit::singleline(&mut self.server_address),
+            );
         });
         ui.horizontal(|ui| {
-            if ui.button("Connect").clicked() {
+            if ui
+                .add_enabled(connection.can_connect(), egui::Button::new("Connect"))
+                .clicked()
+            {
                 self.connect();
             }
-            if ui.button("Disconnect").clicked() {
-                *self.state.client.lock().unwrap() = None;
-                *self.state.connection.lock().unwrap() = ConnectionStatus::Disconnected;
-                self.state.set_status("Disconnected");
+            if ui
+                .add_enabled(
+                    connection != ConnectionStatus::Disconnected,
+                    egui::Button::new("Disconnect"),
+                )
+                .clicked()
+            {
+                self.disconnect();
             }
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Log").strong());
+        ui.label(egui::RichText::new("Log (local UTC times)").strong());
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -941,29 +1171,52 @@ impl TraderApp {
     // --------------------------------------------------------------- requests
 
     fn connect(&mut self) {
-        let address = self.server_address.clone();
+        let address = self.server_address.trim().to_string();
         let state = self.state.clone();
+        let generation = state.begin_session();
         *state.connection.lock().unwrap() = ConnectionStatus::Connecting;
         state.set_status(format!("Connecting to {address}"));
 
-        let runtime = state.runtime.clone();
         thread::spawn(move || {
-            let endpoint = format!("http://{address}");
-            match runtime.block_on(ExecutionServiceClient::connect(endpoint)) {
-                Ok(client) => {
-                    *state.client.lock().unwrap() = Some(client);
-                    *state.connection.lock().unwrap() = ConnectionStatus::Connected;
+            let connected = Endpoint::from_shared(format!("http://{address}"))
+                .map(|endpoint| endpoint.connect_timeout(CONNECT_TIMEOUT))
+                .map_err(|error| error.to_string())
+                .and_then(|endpoint| {
+                    state
+                        .runtime
+                        .block_on(endpoint.connect())
+                        .map_err(|error| error.to_string())
+                });
+
+            let mut connection = state.connection.lock().unwrap();
+            // A disconnect or a newer connect happened while this one was pending.
+            if !state.is_current(generation) {
+                return;
+            }
+            match connected {
+                Ok(channel) => {
+                    *state.client.lock().unwrap() = Some(ExecutionServiceClient::new(channel));
+                    *connection = ConnectionStatus::Connected;
+                    drop(connection);
                     state.set_status(format!("Connected to {address}"));
                     state.log(format!("connected to {address}"));
-                    stream_fills(state.clone());
+                    stream_fills(state.clone(), generation);
                 }
                 Err(error) => {
-                    *state.connection.lock().unwrap() = ConnectionStatus::Error(format!("{error}"));
+                    *connection = ConnectionStatus::Error(format!("connection failed: {error}"));
+                    drop(connection);
                     state.set_status("Connection failed");
                     state.log(format!("connection to {address} failed: {error}"));
                 }
             }
         });
+    }
+
+    fn disconnect(&mut self) {
+        self.state.begin_session();
+        *self.state.connection.lock().unwrap() = ConnectionStatus::Disconnected;
+        self.state.set_status("Disconnected");
+        self.state.log("disconnected");
     }
 
     fn submit_order(&mut self) {
@@ -982,7 +1235,7 @@ impl TraderApp {
         };
 
         let state = self.state.clone();
-        let runtime = state.runtime.clone();
+        let generation = state.generation();
         let summary = format!(
             "{} {} {}",
             side_label(request.side),
@@ -990,9 +1243,9 @@ impl TraderApp {
             request.symbol
         );
         thread::spawn(move || {
-            match runtime.block_on(client.submit_parent_order(request)) {
+            match call(&state.runtime, client.submit_parent_order(request)) {
                 Ok(response) => {
-                    let response = response.into_inner();
+                    state.record_reply(generation, None);
                     if response.accepted {
                         let id = response.parent_order_id;
                         state.log(format!("order #{id} accepted: {summary}"));
@@ -1000,17 +1253,21 @@ impl TraderApp {
                         // Track the id first. The status poll works from this
                         // list, so an order that is accepted but never tracked
                         // would never be polled and would stay invisible.
-                        state.track_order(id);
+                        state.track_order(generation, id);
                         // Then read it back, so the table shows engine state now
                         // rather than after the next poll.
-                        match runtime.block_on(client.get_order_status(OrderStatusRequest {
+                        let request = OrderStatusRequest {
                             parent_order_id: id,
-                        })) {
-                            Ok(status) => update_order(&state, status.into_inner()),
-                            Err(status) => state.log(format!(
-                                "order #{id} accepted, but reading its status failed: {}",
-                                status.message()
-                            )),
+                        };
+                        match call(&state.runtime, client.get_order_status(request)) {
+                            Ok(status) => update_order(&state, generation, status),
+                            Err(status) => {
+                                state.record_reply(generation, Some(&status));
+                                state.log(format!(
+                                    "order #{id} accepted, but reading its status failed: {}",
+                                    status.message()
+                                ));
+                            }
                         }
                     } else {
                         // A business rejection, not a transport failure: the
@@ -1020,6 +1277,7 @@ impl TraderApp {
                     }
                 }
                 Err(status) => {
+                    state.record_reply(generation, Some(&status));
                     state.log(format!(
                         "submit failed: {} ({})",
                         status.message(),
@@ -1036,39 +1294,50 @@ impl TraderApp {
             return;
         };
         let state = self.state.clone();
-        let runtime = state.runtime.clone();
+        let generation = state.generation();
         thread::spawn(move || {
             let request = CancelParentOrderRequest { parent_order_id };
-            match runtime.block_on(client.cancel_parent_order(request)) {
+            match call(&state.runtime, client.cancel_parent_order(request)) {
                 Ok(response) => {
-                    let response = response.into_inner();
-                    if response.cancelled {
-                        state.log(format!("order #{parent_order_id} cancelled"));
+                    state.record_reply(generation, None);
+                    let message = if response.cancelled {
+                        format!("order #{parent_order_id} cancelled")
                     } else {
-                        state.log(format!(
+                        format!(
                             "order #{parent_order_id} not cancelled: {}",
                             response.reason
-                        ));
-                    }
+                        )
+                    };
+                    state.log(message.clone());
+                    state.set_status(message);
                 }
-                Err(status) => state.log(format!("cancel failed: {}", status.message())),
+                Err(status) => {
+                    state.record_reply(generation, Some(&status));
+                    let message = format!("cancel failed: {}", status.message());
+                    state.log(message.clone());
+                    state.set_status(message);
+                }
             }
         });
     }
 
     fn refresh_positions(&self) {
+        let Some(in_flight) = InFlight::claim(&self.state.positions_poll) else {
+            return;
+        };
         let Some(mut client) = self.state.connected_client() else {
             return;
         };
         let state = self.state.clone();
-        let runtime = state.runtime.clone();
+        let generation = state.generation();
         thread::spawn(move || {
+            let _in_flight = in_flight;
             let request = PositionsRequest {
                 symbol: String::new(),
             };
-            match runtime.block_on(client.get_positions(request)) {
+            match call(&state.runtime, client.get_positions(request)) {
                 Ok(response) => {
-                    let response = response.into_inner();
+                    state.record_reply(generation, None);
                     let rows = response
                         .positions
                         .into_iter()
@@ -1083,26 +1352,38 @@ impl TraderApp {
                             mark_price: position.mark_price_ticks.map(ticks_to_price),
                         })
                         .collect();
-                    *state.positions.lock().unwrap() = rows;
-                    *state.halt_reason.lock().unwrap() = response
-                        .trading_halted
-                        .then_some(response.halt_reason)
-                        .filter(|reason| !reason.is_empty());
+                    {
+                        let mut positions = state.positions.lock().unwrap();
+                        if state.is_current(generation) {
+                            *positions = rows;
+                        }
+                    }
+                    let mut halt_reason = state.halt_reason.lock().unwrap();
+                    if state.is_current(generation) {
+                        *halt_reason = response
+                            .trading_halted
+                            .then_some(response.halt_reason)
+                            .filter(|reason| !reason.is_empty());
+                    }
                 }
-                Err(status) => state.log(format!("positions query failed: {}", status.message())),
+                Err(status) => state.record_reply(generation, Some(&status)),
             }
         });
     }
 
     /// Re-reads every tracked order that is not finished, including one the UI
-    /// holds no status for at all.
+    /// holds no status for at all. At most one such poll runs at a time, so
+    /// replies cannot overtake each other.
     fn refresh_working_orders(&self) {
+        let Some(in_flight) = InFlight::claim(&self.state.orders_poll) else {
+            return;
+        };
         let Some(mut client) = self.state.connected_client() else {
             return;
         };
         let ids = {
             // tracked_orders before orders, which is the only order these two are
-            // ever taken in.
+            // ever taken in together.
             let tracked = self.state.tracked_orders.lock().unwrap();
             let orders = self.state.orders.lock().unwrap();
             ids_to_poll(&tracked, &orders)
@@ -1112,16 +1393,27 @@ impl TraderApp {
         }
 
         let state = self.state.clone();
-        let runtime = state.runtime.clone();
+        let generation = state.generation();
         thread::spawn(move || {
+            let _in_flight = in_flight;
             for parent_order_id in ids {
+                if !state.is_current(generation) {
+                    return;
+                }
                 let request = OrderStatusRequest { parent_order_id };
-                match runtime.block_on(client.get_order_status(request)) {
-                    Ok(response) => update_order(&state, response.into_inner()),
-                    Err(status) => state.log(format!(
-                        "status of #{parent_order_id} failed: {}",
-                        status.message()
-                    )),
+                match call(&state.runtime, client.get_order_status(request)) {
+                    Ok(response) => {
+                        state.record_reply(generation, None);
+                        update_order(&state, generation, response);
+                    }
+                    Err(status) if status.code() == Code::NotFound => {
+                        state.record_reply(generation, None);
+                        forget_order(&state, generation, parent_order_id);
+                        state.log(format!(
+                            "order #{parent_order_id} is not known to the engine; no longer polling it"
+                        ));
+                    }
+                    Err(status) => state.record_reply(generation, Some(&status)),
                 }
             }
         });
@@ -1145,8 +1437,9 @@ fn ids_to_poll(tracked: &[u64], orders: &[OrderRow]) -> Vec<u64> {
         .collect()
 }
 
-/// Stores a status reply, replacing any earlier copy of the same order.
-fn update_order(state: &AppState, status: api::proto::OrderStatusResponse) {
+/// Stores a status reply, replacing any earlier copy of the same order. A reply
+/// from an earlier session is discarded.
+fn update_order(state: &AppState, generation: u64, status: api::proto::OrderStatusResponse) {
     let row = OrderRow {
         parent_order_id: status.parent_order_id,
         symbol: status.symbol,
@@ -1157,6 +1450,8 @@ fn update_order(state: &AppState, status: api::proto::OrderStatusResponse) {
         quantity: status.quantity,
         filled_quantity: status.filled_quantity,
         limit_price: status.limit_price_ticks.map(ticks_to_price),
+        start_time_ns: status.start_time_ns,
+        end_time_ns: status.end_time_ns,
         arrival_mid: ticks_to_price(status.arrival_mid_ticks),
         average_fill_price: status
             .average_fill_price_ticks
@@ -1176,6 +1471,9 @@ fn update_order(state: &AppState, status: api::proto::OrderStatusResponse) {
     };
 
     let mut orders = state.orders.lock().unwrap();
+    if !state.is_current(generation) {
+        return;
+    }
     match orders
         .iter_mut()
         .find(|existing| existing.parent_order_id == row.parent_order_id)
@@ -1185,57 +1483,135 @@ fn update_order(state: &AppState, status: api::proto::OrderStatusResponse) {
     }
 }
 
-/// Subscribes to the fill stream for as long as the connection lasts.
-fn stream_fills(state: AppState) {
-    let Some(mut client) = state.connected_client() else {
+/// Stops polling an order the engine does not recognise, and says so on its row.
+fn forget_order(state: &AppState, generation: u64, parent_order_id: u64) {
+    let mut tracked = state.tracked_orders.lock().unwrap();
+    let mut orders = state.orders.lock().unwrap();
+    if !state.is_current(generation) {
         return;
-    };
-    let runtime = state.runtime.clone();
-    thread::spawn(move || {
-        let stream = runtime.block_on(client.stream_fills(StreamFillsRequest {}));
-        let mut stream = match stream {
-            Ok(response) => response.into_inner(),
-            Err(status) => {
-                state.log(format!("fill stream refused: {}", status.message()));
-                return;
-            }
-        };
-        state.log("subscribed to the fill stream");
+    }
+    tracked.retain(|id| *id != parent_order_id);
+    if let Some(row) = orders
+        .iter_mut()
+        .find(|row| row.parent_order_id == parent_order_id)
+    {
+        row.state = "UNKNOWN".to_string();
+        row.state_reason = "the engine does not know this order; it may have restarted".to_string();
+    }
+}
 
-        loop {
-            match runtime.block_on(stream.message()) {
-                Ok(Some(fill)) => {
-                    let row = FillRow {
-                        parent_order_id: fill.parent_order_id,
-                        child_order_id: fill.child_order_id,
-                        symbol: fill.symbol,
-                        side: side_label(fill.side).to_string(),
-                        price: ticks_to_price(fill.price_ticks),
-                        quantity: fill.quantity,
-                        timestamp_ns: fill.timestamp_ns,
-                    };
-                    let mut fills = state.fills.lock().unwrap();
-                    fills.push_back(row);
-                    while fills.len() > 500 {
-                        fills.pop_front();
+/// Appends a fill unless its session is over. Returns whether the session is
+/// still current.
+fn push_fill(state: &AppState, generation: u64, fill: FillRow) -> bool {
+    let mut fills = state.fills.lock().unwrap();
+    if !state.is_current(generation) {
+        return false;
+    }
+    fills.push_back(fill);
+    while fills.len() > MAX_FILLS {
+        fills.pop_front();
+    }
+    true
+}
+
+/// Fill prices per symbol against seconds since the earliest fill shown, so
+/// symbols at very different prices never share one line.
+fn fill_series(fills: &[FillRow]) -> BTreeMap<String, Vec<[f64; 2]>> {
+    let origin = fills
+        .iter()
+        .map(|fill| fill.timestamp_ns)
+        .min()
+        .unwrap_or(0);
+    let mut series: BTreeMap<String, Vec<[f64; 2]>> = BTreeMap::new();
+    for fill in fills {
+        series
+            .entry(fill.symbol.clone())
+            .or_default()
+            .push([(fill.timestamp_ns - origin) as f64 / 1e9, fill.price]);
+    }
+    series
+}
+
+/// Subscribes to the fill stream for the life of the session, resubscribing with
+/// backoff when the stream ends. A new session stops it promptly, even while it
+/// is waiting for a fill.
+fn stream_fills(state: AppState, generation: u64) {
+    thread::spawn(move || {
+        let mut session_change = state.generation.subscribe();
+        let mut backoff = Duration::from_millis(500);
+        while state.is_current(generation) {
+            let Some(mut client) = state.connected_client() else {
+                return;
+            };
+            let subscribed = state.runtime.block_on(async {
+                tokio::select! {
+                    reply = client.stream_fills(StreamFillsRequest {}) => Some(reply),
+                    _ = session_change.changed() => None,
+                }
+            });
+            let reason = match subscribed {
+                None => return,
+                Some(Err(status)) => {
+                    state.record_reply(generation, Some(&status));
+                    format!("subscription refused: {}", status.message())
+                }
+                Some(Ok(response)) => {
+                    state.record_reply(generation, None);
+                    state.set_stream_status(generation, "live");
+                    state.log("subscribed to the fill stream");
+                    backoff = Duration::from_millis(500);
+                    let mut stream = response.into_inner();
+                    loop {
+                        let next = state.runtime.block_on(async {
+                            tokio::select! {
+                                message = stream.message() => Some(message),
+                                _ = session_change.changed() => None,
+                            }
+                        });
+                        match next {
+                            None => return,
+                            Some(Ok(Some(fill))) => {
+                                let row = FillRow {
+                                    parent_order_id: fill.parent_order_id,
+                                    child_order_id: fill.child_order_id,
+                                    symbol: fill.symbol,
+                                    side: side_label(fill.side).to_string(),
+                                    price: ticks_to_price(fill.price_ticks),
+                                    quantity: fill.quantity,
+                                    timestamp_ns: fill.timestamp_ns,
+                                };
+                                if !push_fill(&state, generation, row) {
+                                    return;
+                                }
+                            }
+                            Some(Ok(None)) => break "the engine ended the stream".to_string(),
+                            Some(Err(status)) if status.code() == Code::DataLoss => {
+                                break "fell behind and missed fills".to_string();
+                            }
+                            Some(Err(status)) => {
+                                state.record_reply(generation, Some(&status));
+                                break format!("stream failed: {}", status.message());
+                            }
+                        }
                     }
                 }
-                // The engine shut the stream down cleanly.
-                Ok(None) => {
-                    state.log("fill stream ended");
-                    return;
-                }
-                Err(status) => {
-                    // DATA_LOSS means this subscriber fell behind; the engine
-                    // says to reconcile with GetOrderStatus, which the poll does.
-                    state.log(format!(
-                        "fill stream ended: {} ({})",
-                        status.message(),
-                        status.code()
-                    ));
-                    return;
-                }
+            };
+
+            if !state.is_current(generation) {
+                return;
             }
+            state.log(format!("fill stream: {reason}; resubscribing"));
+            state.set_stream_status(generation, format!("resubscribing ({reason})"));
+            let cancelled = state.runtime.block_on(async {
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => false,
+                    _ = session_change.changed() => true,
+                }
+            });
+            if cancelled {
+                return;
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
     });
 }
@@ -1279,8 +1655,9 @@ mod tests {
     }
 
     #[test]
-    fn limit_prices_convert_to_ticks_not_whole_units() {
-        // The earlier client sent 50000 here, understating the price 100_000x.
+    fn limit_prices_convert_to_ticks_not_cents() {
+        // The original client multiplied by 100 and sent 5_000_000 here: the
+        // price in cents, where the engine wants ticks, so 1_000x too small.
         assert_eq!(parse_limit_price("50000"), Ok(Some(5_000_000_000)));
         assert_eq!(parse_limit_price("0.29"), Ok(Some(29_000)));
         assert!(parse_limit_price("-1").is_err());
@@ -1387,6 +1764,14 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_overflows_the_clock_is_rejected() {
+        // Adding the duration to the start time used to overflow, which panics
+        // in a debug build and wraps to an end before the start in release.
+        let error = form().to_request(u64::MAX - 5).unwrap_err();
+        assert!(error.contains("too long"), "{error}");
+    }
+
+    #[test]
     fn money_and_prices_are_scaled_by_the_tick_size() {
         assert_eq!(ticks_to_price(5_000_000_000), 50_000.0);
         assert_eq!(money_to_currency(-250_000), -2.5);
@@ -1431,11 +1816,50 @@ mod tests {
             quantity: 100,
             filled_quantity: 0,
             limit_price: None,
+            start_time_ns: 0,
+            end_time_ns: 1,
             arrival_mid: 0.0,
             average_fill_price: None,
             shortfall_bps: None,
             pending_slices: 0,
             children: Vec::new(),
+        }
+    }
+
+    fn status_reply(
+        parent_order_id: u64,
+        filled: u64,
+        order_state: ParentOrderState,
+    ) -> api::proto::OrderStatusResponse {
+        api::proto::OrderStatusResponse {
+            parent_order_id,
+            symbol: "BTC-USD".to_string(),
+            side: api::proto::Side::Buy as i32,
+            algorithm: "TWAP".to_string(),
+            state: order_state as i32,
+            state_reason: String::new(),
+            quantity: 100,
+            filled_quantity: filled,
+            limit_price_ticks: None,
+            start_time_ns: 0,
+            end_time_ns: 1,
+            arrival_mid_ticks: 5_000_000_000,
+            average_fill_price_ticks: Some(5_000_000_000.0),
+            shortfall_bps: Some(1.5),
+            pending_slices: 3,
+            children: Vec::new(),
+        }
+    }
+
+    fn fill(symbol: &str, price: f64, timestamp_ns: u64) -> FillRow {
+        FillRow {
+            parent_order_id: 1,
+            child_order_id: 1,
+            symbol: symbol.to_string(),
+            side: "BUY".to_string(),
+            price,
+            quantity: 1,
+            timestamp_ns,
         }
     }
 
@@ -1450,7 +1874,7 @@ mod tests {
     #[test]
     fn polling_stops_once_an_order_is_finished() {
         assert_eq!(ids_to_poll(&[7], &[row(7, "WORKING")]), vec![7]);
-        for finished in ["FILLED", "CANCELLED", "EXPIRED"] {
+        for finished in ["FILLED", "CANCELLED", "EXPIRED", "UNKNOWN"] {
             assert!(
                 ids_to_poll(&[7], &[row(7, finished)]).is_empty(),
                 "{finished} should not be polled again"
@@ -1467,36 +1891,27 @@ mod tests {
     #[test]
     fn tracking_the_same_order_twice_keeps_one_entry() {
         let state = AppState::new();
-        state.track_order(5);
-        state.track_order(5);
-        state.track_order(6);
+        let generation = state.generation();
+        state.track_order(generation, 5);
+        state.track_order(generation, 5);
+        state.track_order(generation, 6);
         assert_eq!(*state.tracked_orders.lock().unwrap(), vec![5, 6]);
     }
 
     #[test]
     fn a_status_reply_replaces_the_earlier_copy_of_that_order() {
         let state = AppState::new();
-        let reply = |filled, order_state: ParentOrderState| api::proto::OrderStatusResponse {
-            parent_order_id: 7,
-            symbol: "BTC-USD".to_string(),
-            side: api::proto::Side::Buy as i32,
-            algorithm: "TWAP".to_string(),
-            state: order_state as i32,
-            state_reason: String::new(),
-            quantity: 100,
-            filled_quantity: filled,
-            limit_price_ticks: None,
-            start_time_ns: 0,
-            end_time_ns: 1,
-            arrival_mid_ticks: 5_000_000_000,
-            average_fill_price_ticks: Some(5_000_000_000.0),
-            shortfall_bps: Some(1.5),
-            pending_slices: 3,
-            children: Vec::new(),
-        };
-
-        update_order(&state, reply(40, ParentOrderState::Working));
-        update_order(&state, reply(100, ParentOrderState::Filled));
+        let generation = state.generation();
+        update_order(
+            &state,
+            generation,
+            status_reply(7, 40, ParentOrderState::Working),
+        );
+        update_order(
+            &state,
+            generation,
+            status_reply(7, 100, ParentOrderState::Filled),
+        );
 
         let orders = state.orders.lock().unwrap();
         assert_eq!(orders.len(), 1, "the same order must not be listed twice");
@@ -1504,5 +1919,121 @@ mod tests {
         assert_eq!(orders[0].state, "FILLED");
         assert!(orders[0].is_terminal());
         assert_eq!(orders[0].average_fill_price, Some(50_000.0));
+    }
+
+    #[test]
+    fn a_new_session_forgets_everything_the_last_one_reported() {
+        let state = AppState::new();
+        let first = state.generation();
+        state.track_order(first, 1);
+        update_order(&state, first, status_reply(1, 0, ParentOrderState::Working));
+        assert!(push_fill(&state, first, fill("SIM-EQ", 100.0, 1)));
+        *state.halt_reason.lock().unwrap() = Some("loss limit".to_string());
+
+        let second = state.begin_session();
+
+        assert_eq!(second, first + 1);
+        assert!(!state.is_current(first));
+        assert!(state.tracked_orders.lock().unwrap().is_empty());
+        assert!(state.orders.lock().unwrap().is_empty());
+        assert!(state.fills.lock().unwrap().is_empty());
+        assert!(state.halt_reason.lock().unwrap().is_none());
+        assert!(state.connected_client().is_none());
+    }
+
+    #[test]
+    fn replies_from_an_old_session_are_discarded() {
+        // Reconnecting used to leave the old fill stream running, so every fill
+        // was shown twice, and late replies could land in the new session.
+        let state = AppState::new();
+        let old = state.generation();
+        state.begin_session();
+
+        update_order(&state, old, status_reply(1, 0, ParentOrderState::Working));
+        state.track_order(old, 1);
+        assert!(!push_fill(&state, old, fill("SIM-EQ", 100.0, 1)));
+
+        assert!(state.orders.lock().unwrap().is_empty());
+        assert!(state.tracked_orders.lock().unwrap().is_empty());
+        assert!(state.fills.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_order_the_engine_no_longer_knows_stops_being_polled() {
+        let state = AppState::new();
+        let generation = state.generation();
+        state.track_order(generation, 2);
+        update_order(
+            &state,
+            generation,
+            status_reply(2, 0, ParentOrderState::Working),
+        );
+
+        forget_order(&state, generation, 2);
+
+        let tracked = state.tracked_orders.lock().unwrap();
+        let orders = state.orders.lock().unwrap();
+        assert!(ids_to_poll(&tracked, &orders).is_empty());
+        assert_eq!(orders[0].state, "UNKNOWN");
+        assert!(orders[0].state_reason.contains("does not know"));
+    }
+
+    #[test]
+    fn the_indicator_follows_reachability_not_rejections() {
+        let connected = ConnectionStatus::Connected;
+        let unavailable = Status::unavailable("connection refused");
+
+        let down = status_after_reply(&connected, Some(&unavailable));
+        assert_eq!(
+            down,
+            ConnectionStatus::Unreachable("connection refused".to_string())
+        );
+        assert!(
+            down.has_client(),
+            "polling continues so recovery is noticed"
+        );
+        assert!(down.can_connect());
+
+        // Any reply, even NOT_FOUND, proves the engine is reachable again.
+        assert_eq!(
+            status_after_reply(&down, Some(&Status::not_found("no order"))),
+            ConnectionStatus::Connected
+        );
+        assert_eq!(status_after_reply(&down, None), ConnectionStatus::Connected);
+
+        // An error reply while connected is not a reachability problem.
+        assert_eq!(
+            status_after_reply(&connected, Some(&Status::invalid_argument("bad side"))),
+            ConnectionStatus::Connected
+        );
+        // A late failure cannot undo a disconnect.
+        assert_eq!(
+            status_after_reply(&ConnectionStatus::Disconnected, Some(&unavailable)),
+            ConnectionStatus::Disconnected
+        );
+        assert!(!ConnectionStatus::Connected.can_connect());
+        assert!(!ConnectionStatus::Connecting.can_connect());
+    }
+
+    #[test]
+    fn only_one_request_of_a_kind_runs_at_a_time() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = InFlight::claim(&flag).expect("nothing is running");
+        assert!(InFlight::claim(&flag).is_none(), "a second poll must wait");
+        drop(first);
+        assert!(InFlight::claim(&flag).is_some(), "released on drop");
+    }
+
+    #[test]
+    fn fills_are_plotted_per_symbol() {
+        let fills = [
+            fill("BTC-USD", 65_000.0, 2_000_000_000),
+            fill("SIM-EQ", 100.0, 1_000_000_000),
+            fill("BTC-USD", 65_001.0, 3_000_000_000),
+        ];
+        let series = fill_series(&fills);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series["BTC-USD"], vec![[1.0, 65_000.0], [2.0, 65_001.0]]);
+        assert_eq!(series["SIM-EQ"], vec![[0.0, 100.0]]);
     }
 }

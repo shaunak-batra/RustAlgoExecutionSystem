@@ -4295,7 +4295,6 @@ version = "0.1.0"
 dependencies = [
  "api",
  "eframe",
- "egui",
  "egui_plot",
  "env_logger",
  "orderbook",

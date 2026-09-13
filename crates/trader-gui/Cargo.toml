@@ -9,7 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = { workspace = true }
-egui = { workspace = true }
 egui_plot = "0.29"
 tokio = { workspace = true }
 tonic = { workspace = true }
