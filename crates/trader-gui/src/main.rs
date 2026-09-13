@@ -38,8 +38,8 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Response, Status};
 
 /// Symbols in the shipped `config/default.toml`, offered as quick fills. The API
-/// has no "list symbols" call, and `GetPositions` only reports symbols the engine
-/// has sent a child order for, so these are a convenience, not a source of truth.
+/// has no "list symbols" call, and `GetPositions` only reports symbols that have
+/// had a fill, so these are a convenience, not a source of truth.
 const DEFAULT_SYMBOLS: [&str; 3] = ["BTC-USD", "ETH-USD", "SIM-EQ"];
 
 /// How long to wait for the engine to accept a connection.
