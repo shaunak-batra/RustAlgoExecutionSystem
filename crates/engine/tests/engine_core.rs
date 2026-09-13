@@ -463,3 +463,75 @@ fn only_the_most_recent_finished_orders_are_retained() {
     assert!(engine.order_status(ids[1]).is_some());
     assert!(engine.order_status(ids[2]).is_some());
 }
+
+#[test]
+fn the_kill_switch_marks_losses_against_a_full_book() {
+    // One level of 60 per side. The first child takes all 60 asks at MID + STEP.
+    // The loss check used to run before quotes were refreshed, found no ask, so
+    // no mid, and counted no unrealized loss; here the position reached 180
+    // before any check saw the loss.
+    let limits = RiskLimits {
+        max_loss: 50_000,
+        ..generous_limits()
+    };
+    let mut engine = engine_with(limits, 1, 60);
+    let id = engine.submit(twap(Side::Buy, 300, 1, 4, 3), 0).unwrap();
+
+    assert_eq!(total_filled(&run_seconds(&mut engine, 1, 1)), 60);
+
+    // 60 bought at MID + STEP and marked at MID is -60 * STEP = -60_000.
+    assert!(
+        engine.halt_reason().is_some(),
+        "the loss is past the limit after the first tick"
+    );
+    assert_eq!(
+        engine.order_status(id).unwrap().state,
+        ParentOrderState::Cancelled
+    );
+}
+
+#[test]
+fn queries_and_submissions_between_ticks_see_a_full_book() {
+    let mut engine = engine(1, 60);
+    engine.submit(twap(Side::Buy, 100, 1, 2, 1), 0).unwrap();
+    run_seconds(&mut engine, 1, 1); // takes every ask
+
+    let position = &engine.positions(Some("SIM")).positions[0];
+    assert_eq!(position.mark_price, Some(Price::new(MID)));
+    assert_eq!(position.unrealized_pnl, Some(-60 * i128::from(STEP)));
+    // This used to be rejected with "no two-sided market", and gross exposure
+    // left the drained symbol out entirely.
+    assert!(engine.submit(twap(Side::Buy, 10, 2, 3, 1), SECOND).is_ok());
+}
+
+#[test]
+fn slices_no_tick_reached_go_out_when_the_window_ends() {
+    // Ticks only at 0 s, 5 s and 10 s. Slices 6 to 9 fall after the last tick
+    // inside the window, and used to be dropped with the order expiring 40 short.
+    let mut engine = engine(5, 10_000);
+    let id = engine.submit(twap(Side::Buy, 100, 0, 10, 10), 0).unwrap();
+    for second in [0, 5, 10] {
+        engine.tick(second * SECOND);
+    }
+
+    let status = engine.order_status(id).unwrap();
+    let children: Vec<(u64, u64)> = status
+        .children
+        .iter()
+        .map(|child| (child.sent_at_ns, child.quantity))
+        .collect();
+    assert_eq!(children, vec![(0, 10), (5 * SECOND, 50), (10 * SECOND, 40)]);
+    assert_eq!(status.state, ParentOrderState::Filled);
+    assert_eq!(status.pending_slices, 0);
+}
+
+#[test]
+fn a_child_that_fills_nothing_leaves_no_position() {
+    let mut engine = engine(5, 1_000);
+    let mut passive = twap(Side::Buy, 10, 1, 2, 1);
+    passive.limit_price = Some(Price::new(MID)); // below the best ask
+    engine.submit(passive, 0).unwrap();
+
+    run_seconds(&mut engine, 1, 2);
+    assert!(engine.positions(None).positions.is_empty());
+}

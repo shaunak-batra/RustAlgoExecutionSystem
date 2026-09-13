@@ -9,10 +9,12 @@ use thiserror::Error;
 pub struct RiskLimits {
     /// Largest quantity of a single parent order.
     pub max_order_qty: u64,
-    /// Largest notional of a single parent order, priced at the worse (higher)
-    /// of its limit price and the mid.
+    /// Largest notional of a single parent order, priced at the higher of its
+    /// limit price and the mid, whichever side the order is on.
     pub max_order_notional: TickValue,
-    /// Largest absolute position per symbol, assuming every working order fills.
+    /// Largest absolute position per symbol a new order may lead to, counting
+    /// the new order and the unfilled working orders on its side as if they all
+    /// filled.
     pub max_position_qty: u64,
     /// Largest gross exposure across symbols, including the new order:
     /// the sum of (|position| + unfilled working quantity) × mid.
@@ -188,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn notional_uses_the_worse_of_limit_and_mid() {
+    fn notional_uses_the_higher_of_limit_and_mid() {
         assert!(check(Side::Buy, 1_000, None, flat()).is_ok());
         // A limit above the mid is priced at the limit...
         assert!(matches!(

@@ -9,7 +9,7 @@
 tick_interval_ms = 50
 # Capacity of the channel from the gRPC service to the engine task.
 command_buffer = 1024
-# How many fills a slow StreamFills client may fall behind before its stream ends with DATA_LOSS.
+# Roughly how many fills a slow StreamFills client may fall behind before its stream ends with DATA_LOSS.
 fill_buffer = 4096
 # Finished parent orders kept for GetOrderStatus; older ones are forgotten.
 retained_finished_orders = 10000
@@ -21,9 +21,10 @@ listen_addr = "127.0.0.1:50051"
 [risk]
 # Largest single parent order, in units.
 max_order_qty = 100000
-# Largest single parent order notional, priced at the worse of its limit price and the mid.
+# Largest single parent order notional, priced at the higher of its limit price and the mid.
 max_order_notional = 10000000.0
-# Largest absolute position per symbol, counting unfilled working orders as if they filled.
+# Largest absolute position per symbol, counting a new order and the unfilled working
+# orders on its side as if they all filled.
 max_position_qty = 500000
 # Largest gross exposure across all symbols, including working orders.
 max_gross_notional = 50000000.0

@@ -1,9 +1,12 @@
 //! Deterministic engine core.
 //!
 //! Every state change happens in an [`EngineCore`] method that takes the
-//! current time as an argument. Feeding the same commands with the same
-//! timestamps always produces the same child orders, fills and P&L, which is
-//! what makes the engine testable without a clock.
+//! current time as an argument, and no method reads a clock. Feeding the same
+//! commands with the same timestamps produces the same child orders, fills and
+//! P&L on a given build and platform (the Almgren-Chriss schedule uses libm
+//! exponentials, which are not guaranteed bit-identical across platforms). That
+//! is what makes the engine testable without a clock. The async wrapper in
+//! `event_loop` is the part that reads the wall clock and passes it in.
 
 use crate::accounting::{Position, TickValue};
 use crate::risk::{RiskLimits, RiskViolation, SymbolExposure};
@@ -143,11 +146,12 @@ impl EngineCore {
         if order.end_ns <= now_ns {
             return Err(RejectReason::WindowEnded);
         }
-        let schedule = build_schedule(&order)?;
         let mid = self
             .venue
             .mid(&order.symbol)
             .ok_or_else(|| RejectReason::NoMarket(order.symbol.clone()))?;
+        // Risk before the schedule: the checks are cheap, and a schedule can have
+        // a million slices.
         self.risk.check_new_order(
             order.side,
             order.quantity,
@@ -155,6 +159,7 @@ impl EngineCore {
             self.exposure(&order.symbol, mid),
             self.gross_notional(),
         )?;
+        let schedule = build_schedule(&order)?;
 
         let id = self.next_parent_id;
         self.next_parent_id += 1;
@@ -184,61 +189,77 @@ impl EngineCore {
 
     /// Advances the engine to `now_ns`.
     ///
-    /// Refreshes the simulated quotes, then for each working parent order in id
-    /// order: expires it if its window has ended, or otherwise sends the
-    /// quantity now due as one IOC child order and applies the fills. Finally
-    /// trips the kill switch if the loss limit is breached. Returns the fills
-    /// in execution order.
+    /// For each working parent order in id order, sends the quantity now due as
+    /// one IOC child order and applies the fills; an order whose window is over
+    /// then finishes. Afterwards the simulated quotes are refreshed and the kill
+    /// switch is checked. Returns the fills in execution order.
+    ///
+    /// Refreshing at the end rather than the start changes nothing about what
+    /// children trade against, because nothing trades between ticks. What it
+    /// changes is that the loss check, and every query and submission until the
+    /// next tick, see a full ladder rather than one this tick's fills drained.
     pub fn tick(&mut self, now_ns: u64) -> Vec<FillReport> {
-        self.venue.refresh_quotes();
         let mut fills = Vec::new();
         let mut finished = Vec::new();
         let mut accounting_failure = None;
 
         for &id in &self.working {
+            // After an accounting overflow no further child orders go out; the
+            // halt at the end of the tick cancels whatever is left.
+            if accounting_failure.is_some() {
+                break;
+            }
             let Some(parent) = self.parents.get_mut(&id) else {
                 continue;
             };
-            if now_ns >= parent.end_ns {
-                parent.finish_window();
-            } else {
-                let qty = parent.release_due(now_ns);
-                if qty > 0 {
-                    let child_id = self.next_child_id;
-                    self.next_child_id += 1;
-                    parent.record_child(child_id, now_ns, qty);
-                    let order = child_order(child_id, parent.side, parent.limit_price, qty, now_ns);
-                    match self.venue.execute(&parent.symbol, order) {
-                        Ok(result) => {
+            // A slice is released on the first tick at or after its time. On the
+            // first tick at or after the window's end, that is every slice no
+            // earlier tick reached, so they go out as one last child instead of
+            // being dropped when ticks are coarser than the slices.
+            let qty = parent.release_due(now_ns);
+            if qty > 0 {
+                let child_id = self.next_child_id;
+                self.next_child_id += 1;
+                parent.record_child(child_id, now_ns, qty);
+                let order = child_order(child_id, parent.side, parent.limit_price, qty, now_ns);
+                match self.venue.execute(&parent.symbol, order) {
+                    Ok(result) => {
+                        for fill in result.fills {
+                            let filled = fill.qty.value();
+                            // A position is created by its first fill, so a child
+                            // that fills nothing leaves no empty row behind.
                             let position = self.positions.entry(parent.symbol.clone()).or_default();
-                            for fill in result.fills {
-                                let filled = fill.qty.value();
-                                parent.record_fill(fill.price, filled);
-                                if let Err(overflow) =
-                                    position.apply_fill(parent.side, fill.price, filled)
-                                {
-                                    accounting_failure =
-                                        Some(format!("{} position: {overflow}", parent.symbol));
-                                }
-                                fills.push(FillReport {
-                                    parent_order_id: id,
-                                    child_order_id: child_id,
-                                    symbol: parent.symbol.clone(),
-                                    side: parent.side,
-                                    price: fill.price,
-                                    quantity: filled,
-                                    timestamp_ns: now_ns,
-                                });
+                            if let Err(overflow) =
+                                position.apply_fill(parent.side, fill.price, filled)
+                            {
+                                // Record nothing the position could not take, so the
+                                // order, the fill stream and the position agree.
+                                accounting_failure =
+                                    Some(format!("{} position: {overflow}", parent.symbol));
+                                break;
                             }
-                            parent.finish_if_filled();
+                            parent.record_fill(fill.price, filled);
+                            fills.push(FillReport {
+                                parent_order_id: id,
+                                child_order_id: child_id,
+                                symbol: parent.symbol.clone(),
+                                side: parent.side,
+                                price: fill.price,
+                                quantity: filled,
+                                timestamp_ns: now_ns,
+                            });
                         }
-                        Err(e) => error!(
-                            parent_order_id = id,
-                            child_order_id = child_id,
-                            "child order failed: {e}"
-                        ),
+                        parent.finish_if_filled();
                     }
+                    Err(e) => error!(
+                        parent_order_id = id,
+                        child_order_id = child_id,
+                        "child order failed: {e}"
+                    ),
                 }
+            }
+            if parent.is_working() && now_ns >= parent.end_ns {
+                parent.finish_window();
             }
             if !parent.is_working() {
                 finished.push(id);
@@ -249,6 +270,7 @@ impl EngineCore {
             self.working.remove(&id);
             self.retire(id);
         }
+        self.venue.refresh_quotes();
         match accounting_failure {
             Some(reason) => self.halt(reason),
             None => self.check_loss_limit(),
@@ -318,15 +340,14 @@ impl EngineCore {
         }
     }
 
-    /// Realized plus unrealized P&L across symbols, marking at the mid.
+    /// Realized plus unrealized P&L across symbols, marked with [`Self::mark`].
     fn total_pnl(&self) -> TickValue {
         self.positions
             .iter()
             .map(|(symbol, position)| {
                 let unrealized = self
-                    .venue
-                    .mid(symbol)
-                    .map_or(0, |mid| position.unrealized_pnl(mid));
+                    .mark(symbol)
+                    .map_or(0, |mark| position.unrealized_pnl(mark));
                 position.realized_pnl.saturating_add(unrealized)
             })
             .fold(0, TickValue::saturating_add)
@@ -358,12 +379,22 @@ impl EngineCore {
         exposure
     }
 
-    /// Sum over symbols of (|position| + unfilled working quantity) × mid.
+    /// The price risk values a symbol at: the mid, or the reference price if a
+    /// side of the book is empty. Quotes are refreshed at the end of every tick,
+    /// so outside a tick the mid is always there; the fallback only stops a
+    /// symbol dropping out of the risk totals if that ever stopped being true.
+    fn mark(&self, symbol: &str) -> Option<Price> {
+        self.venue
+            .mid(symbol)
+            .or_else(|| self.venue.reference_price(symbol))
+    }
+
+    /// Sum over symbols of (|position| + unfilled working quantity) × mark.
     fn gross_notional(&self) -> TickValue {
         self.venue
             .symbols()
             .filter_map(|symbol| {
-                let mid = self.venue.mid(symbol)?;
+                let mid = self.mark(symbol)?;
                 let exposure = self.exposure(symbol, mid);
                 let units = i128::from(exposure.position).abs()
                     + i128::from(exposure.working_buy_qty)

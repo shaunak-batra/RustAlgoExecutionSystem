@@ -135,6 +135,11 @@ impl SimulatedVenue {
         self.markets.get(symbol)?.book.mid()
     }
 
+    /// The price the market maker quotes around.
+    pub fn reference_price(&self, symbol: &str) -> Option<Price> {
+        Some(self.markets.get(symbol)?.config.reference_price)
+    }
+
     /// Top `levels` bid and ask levels.
     pub fn depth(&self, symbol: &str, levels: usize) -> Option<(Depth, Depth)> {
         let book = &self.markets.get(symbol)?.book;

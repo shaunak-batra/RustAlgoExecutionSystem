@@ -20,8 +20,10 @@ pub struct ExecutionEngine {
 }
 
 impl ExecutionEngine {
-    /// `fill_buffer` is how many fills a slow subscriber may fall behind before
-    /// its stream reports data loss.
+    /// `fill_buffer` is roughly how many fills a slow subscriber may fall behind
+    /// before its stream ends with DATA_LOSS: tokio rounds the broadcast capacity
+    /// up to a power of two, and the gRPC layer buffers up to 256 more fills per
+    /// stream on top of that.
     pub fn new(core: EngineCore, tick_interval: Duration, fill_buffer: usize) -> Self {
         let (fills, _) = broadcast::channel(fill_buffer.max(1));
         Self {

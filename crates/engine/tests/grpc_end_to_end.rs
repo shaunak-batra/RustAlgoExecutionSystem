@@ -8,7 +8,7 @@ use api::proto::{
     StreamFillsRequest, SubmitParentOrderRequest, TwapParams,
 };
 use api::EngineCommand;
-use engine::{EngineConfig, EngineCore, ExecutionEngine, RiskLimits, SymbolConfig};
+use engine::{EngineConfig, EngineCore, ExecutionEngine, RiskLimits, ServiceOptions, SymbolConfig};
 use orderbook::{Price, Timestamp};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -154,7 +154,7 @@ async fn orders_fills_status_and_positions_over_grpc() {
         .into_inner();
     assert!(!cancel.cancelled);
 
-    // ...while malformed requests and unknown ids are gRPC errors.
+    // ...while malformed requests, and unknown ids on GetOrderStatus, are gRPC errors.
     let unspecified_side = client
         .submit_parent_order(twap_request("SIM", Side::Unspecified, 10))
         .await
@@ -174,4 +174,45 @@ async fn orders_fills_status_and_positions_over_grpc() {
     engine_task.await.unwrap();
     stop_server.send(()).unwrap();
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_finishes_while_a_fill_stream_is_open() {
+    // The server waits for open streams to end, and a fill stream only ends when
+    // the engine stops. engine::serve stops the engine as part of the shutdown
+    // signal; the binary used to stop it afterwards, which hung here forever.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let options = ServiceOptions {
+        tick_interval: Duration::from_millis(5),
+        command_buffer: 64,
+        fill_buffer: 1_024,
+    };
+    let service = tokio::spawn(engine::serve(core(), options, listener, async {
+        let _ = stopped.await;
+    }));
+
+    let mut client = ExecutionServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let mut fills = client
+        .stream_fills(StreamFillsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    stop.send(()).unwrap();
+    timeout(WAIT, service)
+        .await
+        .expect("shutdown must not hang while a fill stream is open")
+        .unwrap()
+        .unwrap();
+    let last = timeout(WAIT, fills.message())
+        .await
+        .expect("the stream ends");
+    assert!(
+        !matches!(last, Ok(Some(_))),
+        "no fill was traded, so the stream can only have ended"
+    );
 }

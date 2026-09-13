@@ -111,7 +111,10 @@ impl ParentOrder {
     /// Records a fill of the most recent child order.
     pub fn record_fill(&mut self, price: Price, qty: u64) {
         self.filled_qty += qty;
-        self.fill_notional += i128::from(price.ticks()) * i128::from(qty);
+        // Saturates rather than overflowing, which would take over 2^127 ticks x units.
+        self.fill_notional = self
+            .fill_notional
+            .saturating_add(i128::from(price.ticks()) * i128::from(qty));
         if let Some(child) = self.children.last_mut() {
             child.filled_quantity += qty;
         }

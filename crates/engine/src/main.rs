@@ -1,12 +1,13 @@
 //! Engine server: loads settings, then runs the engine task and the gRPC API
 //! until Ctrl+C.
 //!
-//! Usage: `engine [--config <path>]` (default: `config/default.toml`).
+//! Usage: `engine [--config <path>]` (default: `config/default.toml`, relative
+//! to the working directory).
 
-use engine::{EngineConfig, EngineCore, ExecutionEngine};
+use engine::{EngineConfig, EngineCore, ServiceOptions};
 use std::process::ExitCode;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::net::TcpListener;
 use tracing::{error, info};
 
 const DEFAULT_CONFIG: &str = "config/default.toml";
@@ -29,25 +30,23 @@ async fn run() -> Result<(), String> {
     let engine_config = EngineConfig::from_settings(&settings)
         .map_err(|e| format!("invalid settings in {config_path}: {e}"))?;
     let core = EngineCore::new(engine_config).map_err(|e| e.to_string())?;
-
-    let (commands, receiver) = mpsc::channel(settings.engine.command_buffer);
-    let engine = ExecutionEngine::new(
-        core,
-        Duration::from_millis(settings.engine.tick_interval_ms),
-        settings.engine.fill_buffer,
-    );
-    let engine_task = tokio::spawn(engine.run(receiver));
+    let listener = TcpListener::bind(settings.api.listen_addr)
+        .await
+        .map_err(|e| format!("cannot listen on {}: {e}", settings.api.listen_addr))?;
 
     info!("serving the execution API on {}", settings.api.listen_addr);
+    let options = ServiceOptions {
+        tick_interval: Duration::from_millis(settings.engine.tick_interval_ms),
+        command_buffer: settings.engine.command_buffer,
+        fill_buffer: settings.engine.fill_buffer,
+    };
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
         info!("shutting down");
     };
-    let served = api::serve(commands.clone(), settings.api.listen_addr, shutdown).await;
-
-    let _ = commands.send(api::EngineCommand::Shutdown).await;
-    let _ = engine_task.await;
-    served.map_err(|e| format!("the gRPC server failed: {e}"))
+    engine::serve(core, options, listener, shutdown)
+        .await
+        .map_err(|e| format!("the gRPC server failed: {e}"))
 }
 
 fn config_path(mut args: impl Iterator<Item = String>) -> Result<String, String> {

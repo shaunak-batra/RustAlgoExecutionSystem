@@ -14,7 +14,7 @@ pub enum AlgorithmSpec {
     Twap { num_slices: usize },
     /// Quantity proportional to a volume profile (one non-negative weight per slice).
     Vwap { volume_profile: Vec<f64> },
-    /// Almgren–Chriss implementation shortfall (see `algo_core::is`), time in seconds.
+    /// Almgren-Chriss implementation shortfall (see `algo_core::is`), time in seconds.
     ImplementationShortfall {
         num_slices: usize,
         risk_aversion: f64,
@@ -55,7 +55,7 @@ pub enum ParentOrderState {
     Working,
     /// The full quantity executed.
     Filled,
-    /// Stopped by a cancel request or by the kill switch.
+    /// Stopped by a cancel request or by a trading halt.
     Cancelled,
     /// The window ended with quantity unfilled.
     Expired,
@@ -93,7 +93,7 @@ pub struct ParentOrderView {
     /// Cost against the arrival mid in basis points, positive when worse
     /// (paid more on a buy, received less on a sell).
     pub shortfall_bps: Option<f64>,
-    /// Scheduled child orders not yet released.
+    /// Schedule slices not yet released. Several due slices go out as one child.
     pub pending_slices: usize,
     /// Child orders released so far, oldest first.
     pub children: Vec<ChildOrderView>,
@@ -113,11 +113,12 @@ pub struct PositionView {
     pub mark_price: Option<Price>,
 }
 
-/// Every position, plus the kill switch state.
+/// Every position that has had a fill, plus whether trading has halted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionsSnapshot {
     pub positions: Vec<PositionView>,
-    /// Set once the kill switch has halted trading.
+    /// Set once trading has halted: the loss limit was reached, or a fill could
+    /// not be applied without arithmetic overflow.
     pub halt_reason: Option<String>,
 }
 

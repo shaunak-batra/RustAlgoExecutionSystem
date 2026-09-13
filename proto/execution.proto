@@ -9,25 +9,32 @@ package execution;
 // ticks x units (divide by 100000 for price units x units). P&L values outside
 // the int64 range saturate.
 service ExecutionService {
-  // Validates, risk-checks and schedules a parent order. Business rejections
-  // (unknown symbol, invalid schedule, risk limit, halted trading) return
-  // accepted = false with a reason; malformed requests fail with
-  // INVALID_ARGUMENT.
+  // Validates, risk-checks and schedules a parent order. Rejections (trading
+  // halted, unknown symbol, zero quantity, non-positive limit price, window
+  // already over, no two-sided market, risk limit, invalid schedule) return
+  // accepted = false with a reason. Only a malformed request fails with
+  // INVALID_ARGUMENT: side not SIDE_BUY or SIDE_SELL, no algorithm set, or
+  // start_time_ns not set.
   rpc SubmitParentOrder(SubmitParentOrderRequest) returns (SubmitParentOrderResponse);
 
-  // Stops a working parent order from releasing further child orders.
+  // Stops a working parent order from releasing further child orders. An
+  // unknown, finished or no longer retained id returns cancelled = false with a
+  // reason, not an error.
   rpc CancelParentOrder(CancelParentOrderRequest) returns (CancelParentOrderResponse);
 
   // State, fills and child orders of a parent order. NOT_FOUND if the id is
   // unknown or the finished order is no longer retained.
   rpc GetOrderStatus(OrderStatusRequest) returns (OrderStatusResponse);
 
-  // Positions and P&L, and whether the loss kill switch has halted trading.
+  // Positions and P&L, and whether trading has halted: the loss limit was
+  // reached, or a fill could not be applied without arithmetic overflow. A
+  // symbol appears once one of its orders has had a fill.
   rpc GetPositions(PositionsRequest) returns (PositionsResponse);
 
   // Fills of the engine's child orders from the moment of subscription. If the
   // client falls too far behind, the stream ends with DATA_LOSS; resubscribe
-  // and reconcile with GetOrderStatus.
+  // and reconcile with GetOrderStatus. When the engine shuts down the stream
+  // ends with OK.
   rpc StreamFills(StreamFillsRequest) returns (stream FillEvent);
 }
 
@@ -62,7 +69,10 @@ message SubmitParentOrderRequest {
   uint64 quantity = 3;
   // Worst acceptable execution price in ticks. Unset: child orders are market orders.
   optional int64 limit_price_ticks = 4;
-  // Execution window [start_time_ns, end_time_ns).
+  // Execution window [start_time_ns, end_time_ns). start_time_ns must be set. A
+  // slice is released on the first engine tick at or after its time, so slices
+  // already due go out together, and slices no tick reached before the end go
+  // out on the first tick at or after it.
   uint64 start_time_ns = 5;
   uint64 end_time_ns = 6;
   oneof algorithm {
@@ -95,7 +105,7 @@ enum ParentOrderState {
   PARENT_ORDER_STATE_UNSPECIFIED = 0;
   PARENT_ORDER_STATE_WORKING = 1;    // releasing child orders
   PARENT_ORDER_STATE_FILLED = 2;     // the full quantity executed
-  PARENT_ORDER_STATE_CANCELLED = 3;  // by request or by the kill switch
+  PARENT_ORDER_STATE_CANCELLED = 3;  // by request or by a trading halt
   PARENT_ORDER_STATE_EXPIRED = 4;    // the window ended with quantity unfilled
 }
 
@@ -122,7 +132,8 @@ message OrderStatusResponse {
   optional double average_fill_price_ticks = 13;
   // Cost against the arrival mid in basis points; positive when worse.
   optional double shortfall_bps = 14;
-  uint32 pending_slices = 15;  // scheduled child orders not yet released
+  // Schedule slices not yet released. Several due slices go out as one child.
+  uint32 pending_slices = 15;
   repeated ChildOrderReport children = 16;
 }
 

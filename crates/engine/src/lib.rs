@@ -3,7 +3,10 @@
 //! Works parent orders against a simulated venue.
 //!
 //! - [`EngineCore`]: all engine state and every state transition, driven by
-//!   explicit timestamps, so behaviour is deterministic and unit-testable
+//!   explicit timestamps and never by a clock, so a run is reproducible on a
+//!   given build and platform and every scenario is unit-testable
+//! - [`serve`]: runs the engine task and the gRPC API together, and shuts them
+//!   down in an order that cannot hang
 //! - [`ExecutionEngine`]: an async task that owns an `EngineCore`, serves
 //!   [`EngineCommand`]s from a channel, ticks on a timer and broadcasts fills,
 //!   with no shared mutable state or locks
@@ -68,6 +71,7 @@ pub mod accounting;
 pub mod event_loop;
 pub mod executor;
 pub mod risk;
+pub mod service;
 pub mod state;
 pub mod venue;
 
@@ -76,5 +80,6 @@ pub use api::EngineCommand;
 pub use event_loop::ExecutionEngine;
 pub use executor::{CancelError, EngineConfig, EngineCore, RejectReason};
 pub use risk::{RiskLimits, RiskViolation, SymbolExposure};
+pub use service::{serve, ServiceOptions};
 pub use state::ParentOrder;
 pub use venue::{SimulatedVenue, SymbolConfig, VenueError};

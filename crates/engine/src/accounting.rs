@@ -61,7 +61,15 @@ impl Position {
             let removed_cost = if closing == open {
                 self.cost_basis
             } else {
-                self.cost_basis.checked_mul(closing)? / open
+                // trunc(cost_basis * closing / open), split into whole and
+                // remainder parts so the intermediate product cannot overflow
+                // when the result itself fits. The two parts share a sign, so
+                // truncating the remainder part alone gives the same result.
+                let whole = self.cost_basis / open;
+                let remainder = self.cost_basis % open;
+                whole
+                    .checked_mul(closing)?
+                    .checked_add(remainder.checked_mul(closing)? / open)?
             };
             let closing_value = quantity.signum().checked_mul(closing)?.checked_mul(price)?;
             self.realized_pnl = self

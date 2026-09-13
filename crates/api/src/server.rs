@@ -156,7 +156,12 @@ impl ExecutionService for ExecutionServiceImpl {
 
         tokio::spawn(async move {
             loop {
-                let item = match fills.recv().await {
+                let received = tokio::select! {
+                    received = fills.recv() => received,
+                    // The client went away: stop now rather than on the next fill.
+                    _ = sender.closed() => break,
+                };
+                let item = match received {
                     Ok(fill) => Ok(fill_event(fill)),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         Err(Status::data_loss(format!(
@@ -236,6 +241,11 @@ fn new_parent_order(
         }
         None => return Err("an algorithm must be set"),
     };
+    // proto3 delivers an omitted field as 0, which would put the start of the
+    // window in 1970 and make every slice due at once.
+    if request.start_time_ns == 0 {
+        return Err("start_time_ns must be set (Unix epoch nanoseconds)");
+    }
     Ok(NewParentOrder {
         symbol: request.symbol,
         side,
@@ -380,6 +390,16 @@ mod tests {
         })
         .unwrap_err();
         assert!(reason.contains("algorithm"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_an_unset_start_time() {
+        let reason = new_parent_order(proto::SubmitParentOrderRequest {
+            start_time_ns: 0,
+            ..request()
+        })
+        .unwrap_err();
+        assert!(reason.contains("start_time_ns"), "{reason}");
     }
 
     #[test]

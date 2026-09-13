@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { workspace = true }
+tonic = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -20,4 +21,3 @@ config = { path = "../config" }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tonic = { workspace = true }

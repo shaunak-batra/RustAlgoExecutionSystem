@@ -26,10 +26,12 @@ pub struct EngineSettings {
     /// How often due child orders are released and simulated quotes are
     /// refreshed, in milliseconds (1 to 60 000).
     pub tick_interval_ms: u64,
-    /// Capacity of the command channel from the API to the engine task.
+    /// Capacity of the command channel from the API to the engine task
+    /// (1 to 1 000 000).
     pub command_buffer: usize,
-    /// How many fills a slow stream subscriber may fall behind before its
-    /// stream ends with DATA_LOSS.
+    /// Roughly how many fills a slow stream subscriber may fall behind before
+    /// its stream ends with DATA_LOSS (1 to 1 000 000). The channel rounds this
+    /// up to a power of two, and each stream buffers up to 256 more fills.
     pub fill_buffer: usize,
     /// Finished parent orders kept for status queries.
     pub retained_finished_orders: usize,
@@ -46,11 +48,15 @@ pub struct ApiSettings {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RiskSettings {
-    /// Largest quantity of a single parent order.
+    /// Largest quantity of a single parent order (at most `i64::MAX`, the
+    /// largest position the engine can hold).
     pub max_order_qty: u64,
-    /// Largest notional of a single parent order (price units × units).
+    /// Largest notional of a single parent order (price units × units), priced
+    /// at the higher of its limit price and the mid.
     pub max_order_notional: f64,
-    /// Largest absolute position per symbol, counting working orders.
+    /// Largest absolute position per symbol a new order may lead to, counting
+    /// it and the unfilled working orders on its side as if they all filled
+    /// (at most `i64::MAX`).
     pub max_position_qty: u64,
     /// Largest gross exposure across symbols (price units × units).
     pub max_gross_notional: f64,
@@ -119,15 +125,16 @@ impl Settings {
             (1..=60_000).contains(&engine.tick_interval_ms),
             "must be between 1 and 60000",
         )?;
+        // tokio panics on a zero capacity, and on capacities near usize::MAX.
         check(
             "engine.command_buffer",
-            engine.command_buffer > 0,
-            "must be positive",
+            (1..=MAX_BUFFER).contains(&engine.command_buffer),
+            "must be between 1 and 1000000",
         )?;
         check(
             "engine.fill_buffer",
-            engine.fill_buffer > 0,
-            "must be positive",
+            (1..=MAX_BUFFER).contains(&engine.fill_buffer),
+            "must be between 1 and 1000000",
         )?;
         check(
             "engine.retained_finished_orders",
@@ -136,16 +143,8 @@ impl Settings {
         )?;
 
         let risk = &self.risk;
-        check(
-            "risk.max_order_qty",
-            risk.max_order_qty > 0,
-            "must be positive",
-        )?;
-        check(
-            "risk.max_position_qty",
-            risk.max_position_qty > 0,
-            "must be positive",
-        )?;
+        positive_quantity("risk.max_order_qty", risk.max_order_qty)?;
+        positive_quantity("risk.max_position_qty", risk.max_position_qty)?;
         positive_amount("risk.max_order_notional", risk.max_order_notional)?;
         positive_amount("risk.max_gross_notional", risk.max_gross_notional)?;
         positive_amount("risk.max_loss", risk.max_loss)?;
@@ -168,6 +167,13 @@ impl Settings {
                 !symbol.symbol.trim().is_empty(),
                 "must not be empty",
             )?;
+            // Requests must match the symbol exactly, so stray spaces would make
+            // a market impossible to trade.
+            check(
+                &field("symbol"),
+                symbol.symbol.trim() == symbol.symbol,
+                "must not start or end with whitespace",
+            )?;
             check(
                 &field("symbol"),
                 seen.insert(symbol.symbol.as_str()),
@@ -179,11 +185,7 @@ impl Settings {
                 (1..=1_000).contains(&symbol.levels),
                 "must be between 1 and 1000",
             )?;
-            check(
-                &field("qty_per_level"),
-                symbol.qty_per_level > 0,
-                "must be positive",
-            )?;
+            positive_quantity(&field("qty_per_level"), symbol.qty_per_level)?;
             check(
                 &field("level_spacing_bps"),
                 symbol.level_spacing_bps > 0,
@@ -199,6 +201,9 @@ impl Settings {
     }
 }
 
+/// Largest `command_buffer` and `fill_buffer`.
+const MAX_BUFFER: usize = 1_000_000;
+
 fn check(field: &str, ok: bool, reason: &str) -> Result<(), SettingsError> {
     if ok {
         Ok(())
@@ -208,6 +213,15 @@ fn check(field: &str, ok: bool, reason: &str) -> Result<(), SettingsError> {
             reason: reason.to_string(),
         })
     }
+}
+
+/// Quantities become signed 64-bit positions, so they must fit in an `i64`.
+fn positive_quantity(field: &str, value: u64) -> Result<(), SettingsError> {
+    check(
+        field,
+        (1..=i64::MAX.unsigned_abs()).contains(&value),
+        "must be between 1 and 9223372036854775807",
+    )
 }
 
 fn positive_amount(field: &str, value: f64) -> Result<(), SettingsError> {
@@ -254,6 +268,22 @@ mod tests {
         let mut settings = base.clone();
         settings.engine.tick_interval_ms = 0;
         assert_eq!(invalid_field(&settings), "engine.tick_interval_ms");
+
+        let mut settings = base.clone();
+        settings.engine.command_buffer = 0;
+        assert_eq!(invalid_field(&settings), "engine.command_buffer");
+
+        let mut settings = base.clone();
+        settings.engine.fill_buffer = usize::MAX;
+        assert_eq!(invalid_field(&settings), "engine.fill_buffer");
+
+        let mut settings = base.clone();
+        settings.risk.max_order_qty = u64::MAX;
+        assert_eq!(invalid_field(&settings), "risk.max_order_qty");
+
+        let mut settings = base.clone();
+        settings.venue.symbols[0].symbol = format!("{} ", base.venue.symbols[0].symbol);
+        assert_eq!(invalid_field(&settings), "venue.symbols[0].symbol");
 
         let mut settings = base.clone();
         settings.risk.max_loss = f64::NAN;
