@@ -25,18 +25,37 @@ impl ExecutionServiceImpl {
     }
 
     /// Sends a command carrying a fresh reply channel and waits for the answer.
+    ///
+    /// The error is a one-byte enum rather than a `Status`, which is several
+    /// hundred bytes; `?` in the handlers converts it to `UNAVAILABLE`.
     async fn ask<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<T>) -> EngineCommand,
-    ) -> Result<T, Status> {
+    ) -> Result<T, EngineUnavailable> {
         let (reply, answer) = oneshot::channel();
         self.engine
             .send(command(reply))
             .await
-            .map_err(|_| Status::unavailable("the engine is not running"))?;
+            .map_err(|_| EngineUnavailable::NotRunning)?;
         answer
             .await
-            .map_err(|_| Status::unavailable("the engine stopped before replying"))
+            .map_err(|_| EngineUnavailable::StoppedBeforeReplying)
+    }
+}
+
+/// The engine task could not be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineUnavailable {
+    NotRunning,
+    StoppedBeforeReplying,
+}
+
+impl From<EngineUnavailable> for Status {
+    fn from(error: EngineUnavailable) -> Self {
+        Status::unavailable(match error {
+            EngineUnavailable::NotRunning => "the engine is not running",
+            EngineUnavailable::StoppedBeforeReplying => "the engine stopped before replying",
+        })
     }
 }
 
