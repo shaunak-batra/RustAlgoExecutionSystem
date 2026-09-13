@@ -35,11 +35,14 @@ impl Price {
     ///
     /// Rounding rather than truncating is what makes ordinary prices exact:
     /// `0.29 * 100_000.0` is `28999.999999999996` in floating point, which
-    /// truncation would turn into the wrong tick. The result is the nearest tick
-    /// for every price with at most five decimals whose tick count stays below
-    /// `2^53`. Outside that range, or for a price within floating-point error of
-    /// half a tick, the `f64` product decides and the result can be off by a
-    /// tick (by more at very large magnitudes).
+    /// truncation would turn into the wrong tick. For a price with at most five
+    /// decimals, written as the nearest `f64` (as a TOML or Python literal gives),
+    /// the result is exactly its tick count whenever that count is below `2^51`
+    /// in magnitude, a price below about 2.25e10: the two rounding errors
+    /// together stay under half a tick. From `2^51` up they can reach half a
+    /// tick and the result can be off by one (by more at very large
+    /// magnitudes); sampling finds that for about 8% of prices between `2^51` and
+    /// `2^52` ticks.
     ///
     /// NaN maps to zero and out-of-range values saturate, so use
     /// [`Price::try_from_f64`] for untrusted input.
@@ -186,7 +189,8 @@ pub enum TimeInForce {
     FOK,
 }
 
-/// Unique order identifier.
+/// Order identifier. The book rejects an id that is already resting, but the
+/// id of an order that has left the book (filled or cancelled) may be reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct OrderId(pub u64);

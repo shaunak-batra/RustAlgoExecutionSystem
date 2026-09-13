@@ -308,9 +308,10 @@ impl OrderBook {
     }
 
     /// Checks every internal consistency rule of the book in expected `O(n)`:
-    /// no empty levels, no id resting twice, cached level totals match their
-    /// orders, the id index matches the resting orders exactly, resting orders
-    /// are GTC limit orders on the right side and level, and the book is not
+    /// every level has a positive price and at least one order, no id rests
+    /// twice, cached level totals match their orders, the id index matches the
+    /// resting orders exactly, resting orders are GTC limit orders with a
+    /// positive quantity on the right side and level, and the book is not
     /// crossed.
     ///
     /// Intended for tests and debugging; returns a description of the first
@@ -323,6 +324,9 @@ impl OrderBook {
         let mut seen = HashSet::with_capacity(self.index.len());
         for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
             for (&price, level) in levels {
+                if price.ticks() <= 0 {
+                    return Err(format!("{side} level at non-positive price {price}"));
+                }
                 if level.orders.is_empty() {
                     return Err(format!("empty {side} level at {price}"));
                 }
@@ -1042,13 +1046,35 @@ mod tests {
         stale_index.index.insert(OrderId(1), (Side::Buy, px(98.0)));
         assert!(violation(&stale_index).contains("missing or stale"));
 
-        // The same id resting at two levels. The index can only point at one of
-        // them, so the order count still matches and only the id check catches it.
+        // The same id resting at two levels. The id check reports it first; the
+        // index check would catch it too, since the index can point at only one
+        // of the two levels.
         let mut duplicate = book();
         submit(&mut duplicate, limit(1, Side::Buy, 99.0, 5));
         duplicate.rest(limit(1, Side::Buy, 98.0, 5), px(98.0));
         assert_eq!(duplicate.order_count(), 1);
         assert!(violation(&duplicate).contains("rests twice"));
+
+        // The same id twice at one level, plus a stale index entry for an id that
+        // is not resting. Every index lookup matches, the level total matches,
+        // and there are as many index entries as resting orders, so only the id
+        // check can catch this one.
+        let mut duplicate_at_one_level = book();
+        submit(&mut duplicate_at_one_level, limit(1, Side::Buy, 99.0, 5));
+        duplicate_at_one_level.rest(limit(1, Side::Buy, 99.0, 5), px(99.0));
+        duplicate_at_one_level
+            .index
+            .insert(OrderId(2), (Side::Buy, px(99.0)));
+        assert!(violation(&duplicate_at_one_level).contains("rests twice"));
+
+        // validate() rejects non-positive limit prices, so only corruption can
+        // put a level there.
+        let mut non_positive = book();
+        non_positive.rest(
+            Order::limit(OrderId(1), Side::Buy, Price(0), Quantity(5), Timestamp(1)),
+            Price(0),
+        );
+        assert!(violation(&non_positive).contains("non-positive"));
 
         let mut empty_level = book();
         submit(&mut empty_level, limit(1, Side::Buy, 99.0, 5));

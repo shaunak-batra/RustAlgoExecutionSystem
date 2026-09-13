@@ -130,14 +130,19 @@ struct Workload {
 /// - 15% IOC orders priced 0 to 2 ticks through the opposite touch, so each one
 ///   crosses and trades rather than resting or trading nothing.
 ///
-/// The add/cancel choice keeps the resting count inside `TARGET_RESTING ± BAND`.
-/// Without that the book grows as the stream replays, and the per-operation
-/// figure is an average over a book of changing size rather than a steady-state
-/// cost that can be compared between runs.
+/// The add/cancel choice holds the resting count near `TARGET_RESTING`: at
+/// `TARGET_RESTING + BAND` or above, every non-IOC operation is a cancel, so the
+/// count never passes that ceiling. Below `TARGET_RESTING - BAND` no cancels are
+/// chosen, but IOC fills can still take the count lower, so there is no hard
+/// floor. Without this the book grows as the stream replays, and the
+/// per-operation figure is an average over a book of changing size rather than
+/// a steady-state cost that can be compared between runs.
 ///
 /// With seed 7 and 100_000 operations the stream is 48_250 passive limit orders,
 /// 36_830 cancels and 14_920 IOC orders producing 20_956 fills, and the resting
-/// count goes from 800 to 899. [`bench_mixed_workload`] prints these figures and
+/// count goes from 800 to 899. Those figures hold for the `rand` version in
+/// `Cargo.lock`: `StdRng` is not guaranteed to produce the same stream across
+/// `rand` releases. [`bench_mixed_workload`] prints them on every run and
 /// asserts the start and end sizes stay within `BAND` of each other.
 fn mixed_workload(n: usize, start: &OrderBook, first_id: u64, seed: u64) -> Workload {
     let mut rng = StdRng::seed_from_u64(seed);
