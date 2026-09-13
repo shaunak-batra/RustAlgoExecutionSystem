@@ -39,15 +39,17 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # --locked fails the build if Cargo.lock is out of date, so CI tests the
+      # dependency versions that are committed.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Debug build keeps integer-overflow checks on; release catches optimisation-only issues.
       - name: Test (debug)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Test (release)
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --locked
 
   python:
     name: Python bindings (${{ matrix.python-version }})
