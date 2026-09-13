@@ -1,10 +1,13 @@
 """
 Tests for the Python bindings (``algo_exec_py._native``).
 
-Results are compared with independent pure-Python implementations of the
-same definitions (integer TWAP rounding, the Almgren-Chriss closed form, the
-POV participation cap), so a mistake in the Rust code or in the bindings shows
-up as a mismatch.
+Where a definition is short enough to restate, results are compared with an
+independent pure-Python implementation (integer TWAP rounding and slice starts,
+the SplitMix64 draws of the randomized TWAP, the slice a volume bar falls in,
+the Almgren-Chriss closed form). Otherwise they are checked against their
+defining properties (the VWAP prefix bound, and the POV participation cap,
+completeness and prefix invariance). Either way a mistake in the Rust code or
+in the bindings shows up as a failure.
 
 The import is unconditional on purpose: if the extension is not built, the
 suite fails instead of silently skipping.
@@ -132,6 +135,19 @@ class TestTwap:
         assert [time_ns for time_ns, _ in sparse] == [2_058, 4_254, 5_776, 6_768, 9_883]
         assert {t for t, _ in sparse} <= {t for t, _ in dense}
 
+    @pytest.mark.parametrize(
+        "args",
+        [
+            (0, 10, 0, 5, 1),  # zero quantity
+            (0, 10, 100, 0, 1),  # zero slices
+            (10, 10, 100, 5, 1),  # empty window
+            (0, 4, 100, 5, 1),  # slices shorter than 1 ns
+        ],
+    )
+    def test_randomized_invalid_input_raises(self, args):
+        with pytest.raises(ValueError):
+            ae.twap_schedule_randomized(*args)
+
     def test_randomized_times_stay_in_their_slices(self):
         start, end, n = SECOND, 11 * SECOND, 10
         schedule = ae.twap_schedule_randomized(start, end, 1000, n, 42)
@@ -197,6 +213,34 @@ class TestVwap:
         ]
         profile = ae.volume_profile_from_bars(bars, open_, 3_600 * SECOND, 2)
         assert profile == pytest.approx([0.8, 0.2])
+
+    def test_profile_slices_use_the_schedule_boundaries(self):
+        # 10 ns in 3 slices start at 0, 3 and 6, as in twap_schedule and
+        # vwap_schedule, so the bars at 3 and 6 open slices 1 and 2.
+        bars = [(t, 1) for t in (2, 3, 5, 6, 9)]
+        assert ae.volume_profile_from_bars(bars, 0, 10, 3, day_ns=100) == [0.2, 0.4, 0.4]
+
+    @settings(max_examples=300, deadline=None)
+    @given(duration=st.integers(50, 10**6), n=st.integers(1, 50), data=st.data())
+    def test_a_bar_lands_in_the_slice_whose_bounds_contain_it(self, duration, n, data):
+        offset = data.draw(st.integers(0, duration - 1))
+        bounds = reference_slice_starts(0, duration, n) + [duration]
+        expected = next(k for k in range(n) if bounds[k] <= offset < bounds[k + 1])
+        profile = ae.volume_profile_from_bars([(offset, 1)], 0, duration, n, day_ns=duration)
+        assert profile.index(1.0) == expected
+
+    @pytest.mark.parametrize(
+        "args, day_ns",
+        [
+            (([(0, 1)], 0, 10, 1), 0),  # zero-length day
+            (([(0, 1)], 90, 20, 1), 100),  # window crosses midnight
+            (([(50, 1)], 0, 10, 2), 100),  # no volume inside the window
+            (([(0, 1)], 0, 10, 0), 100),  # zero slices
+        ],
+    )
+    def test_profile_from_bars_invalid_input_raises(self, args, day_ns):
+        with pytest.raises(ValueError):
+            ae.volume_profile_from_bars(*args, day_ns=day_ns)
 
 
 class TestPov:
@@ -360,8 +404,8 @@ class TestPricesAndMetadata:
         with pytest.raises(ValueError):
             ae.price_to_ticks(bad)
 
-    def test_native_module_version(self):
-        assert isinstance(_native.__version__, str)
+    def test_native_module_version_matches_the_package(self):
+        assert _native.__version__ == ae.__version__
 
 
 class TestArgumentErrors:

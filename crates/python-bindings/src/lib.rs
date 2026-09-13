@@ -166,7 +166,8 @@ fn almgren_chriss_schedule<'py>(
 }
 
 /// Converts a price to integer ticks, rounding `price * TICK_SCALE` half away
-/// from zero. Exact for prices with at most five decimals.
+/// from zero. Exact for prices with at most five decimals below about 2.25e10
+/// in magnitude (2^51 ticks); see `Price::from_f64`.
 #[pyfunction]
 fn price_to_ticks(price: f64) -> PyResult<i64> {
     Price::try_from_f64(price)
