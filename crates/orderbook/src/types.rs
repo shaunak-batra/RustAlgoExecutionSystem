@@ -37,12 +37,13 @@ impl Price {
     /// `0.29 * 100_000.0` is `28999.999999999996` in floating point, which
     /// truncation would turn into the wrong tick. For a price with at most five
     /// decimals, written as the nearest `f64` (as a TOML or Python literal gives),
-    /// the result is exactly its tick count whenever that count is below `2^51`
-    /// in magnitude, a price below about 2.25e10: the two rounding errors
-    /// together stay under half a tick. From `2^51` up they can reach half a
-    /// tick and the result can be off by one (by more at very large
-    /// magnitudes); sampling finds that for about 8% of prices between `2^51` and
-    /// `2^52` ticks.
+    /// the result is exactly its tick count for every price below `2^35` (about
+    /// 3.44e10, or 3.44e15 ticks): the parsing error is then at most about 0.19
+    /// tick and the multiplication error at most 0.25 tick, together under half
+    /// a tick. For larger prices the parsing error can reach about 0.38 tick and
+    /// the result can be off by one (by more at very large magnitudes). A scan
+    /// finds the first such error at `10^5 * 2^35 + 2` ticks, and sampling finds
+    /// one in about 17% of prices between `10^5 * 2^35` and `2^52` ticks.
     ///
     /// NaN maps to zero and out-of-range values saturate, so use
     /// [`Price::try_from_f64`] for untrusted input.
