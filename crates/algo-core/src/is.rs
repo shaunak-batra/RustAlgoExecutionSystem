@@ -63,11 +63,14 @@ pub struct AlmgrenChrissSchedule {
     pub children: Vec<ChildOrderInstruction>,
     /// Optimal (unrounded) holdings `x_0 ..= x_N` at the slice boundaries.
     pub holdings: Vec<f64>,
-    /// Urgency `κ`, in 1/second. When `κT` is large, holdings decay roughly like `e^{−κt}`.
+    /// Urgency `κ`, in 1/second. When `κT` is large, holdings decay roughly like
+    /// `e^{−κt}`. Zero when `λσ²` is zero or so small that `κ` underflows; the
+    /// children are then exactly TWAP's.
     pub kappa: f64,
     /// Expected impact cost `E` of `holdings`, excluding the fixed spread cost.
+    /// `+inf` if the parameters are extreme enough to overflow `f64`.
     pub expected_cost: f64,
-    /// Variance `V` of the cost of `holdings`.
+    /// Variance `V` of the cost of `holdings`; `+inf` on overflow, as above.
     pub cost_variance: f64,
 }
 
@@ -144,7 +147,9 @@ pub fn compute_almgren_chriss_schedule(
 /// Expected cost `E` and variance `V` of any holdings trajectory under the
 /// model, for comparing schedules (for example TWAP against the optimum).
 ///
-/// `holdings` must have `num_slices + 1` entries, start at `total_qty`, and end at zero.
+/// `holdings` must have `num_slices + 1` entries, all finite, the first exactly
+/// `total_qty as f64` and the last exactly zero. Either cost can be `+inf` if
+/// the inputs are extreme enough to overflow `f64`.
 pub fn almgren_chriss_cost(
     params: &AlmgrenChrissParams,
     holdings: &[f64],
@@ -221,19 +226,23 @@ impl Model {
         // via ln_1p so it stays accurate when y is tiny.
         let y = 0.5 * kappa_tilde_sq * self.tau * self.tau;
         // √(y(y+2)): for large y the product would overflow even though κ is
-        // perfectly finite, so factor y out; below 1 the direct form is exact.
+        // perfectly finite, so factor y out; at or below 1 the direct form
+        // cannot overflow and is accurate to rounding.
         let root = if y > 1.0 {
             y * (1.0 + 2.0 / y).sqrt()
         } else {
             (y * (y + 2.0)).sqrt()
         };
         let kappa = (y + root).ln_1p() / self.tau;
+        // κ itself is at most about ln(2y)/τ, so it can only be non-finite
+        // because λσ²/η̃ or y overflowed on the way.
         if kappa.is_finite() {
             Ok(kappa)
         } else {
             Err(ScheduleError::InvalidParameter {
                 name: "risk_aversion",
-                reason: "risk_aversion * volatility^2 is too large: the urgency κ overflows",
+                reason:
+                    "risk_aversion * volatility^2 / η̃ is too large for f64, so κ cannot be computed",
             })
         }
     }

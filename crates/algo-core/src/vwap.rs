@@ -152,8 +152,8 @@ pub fn volume_profile_from_bars(
         if into_window >= window.duration_ns {
             continue;
         }
-        let slice = u128::from(into_window) * num_slices as u128 / u128::from(window.duration_ns);
-        volume_by_slice[slice as usize] += u128::from(volume);
+        volume_by_slice[slice_containing(into_window, window.duration_ns, num_slices)] +=
+            u128::from(volume);
     }
 
     let total: u128 = volume_by_slice.iter().sum();
@@ -164,6 +164,17 @@ pub fn volume_profile_from_bars(
         .iter()
         .map(|&volume| volume as f64 / total as f64)
         .collect())
+}
+
+/// The slice of a `duration_ns` window cut into `num_slices` that contains
+/// `offset_ns < duration_ns`, with the same boundaries the schedules use
+/// (slice `k` starts at `⌊duration·k / num_slices⌋`). That is the largest `k`
+/// with `⌊duration·k / num_slices⌋ ≤ offset`, which is
+/// `⌊((offset + 1)·num_slices − 1) / duration⌋`. Scaling the offset directly,
+/// `⌊offset·num_slices / duration⌋`, can put a bar one slice early.
+fn slice_containing(offset_ns: u64, duration_ns: u64, num_slices: usize) -> usize {
+    let scaled = (u128::from(offset_ns) + 1) * num_slices as u128 - 1;
+    (scaled / u128::from(duration_ns)) as usize
 }
 
 /// Largest weight in a profile, after checking every weight is finite and non-negative.
@@ -337,6 +348,31 @@ mod tests {
             volume_profile_from_bars(&[(4, 3), (5, 1)], window, 2).unwrap(),
             vec![0.75, 0.25]
         );
+    }
+
+    #[test]
+    fn profile_slices_use_the_schedule_boundaries() {
+        // 10 ns in 3 slices start at offsets 0, 3 and 6. Scaling the offset
+        // (offset * 3 / 10) used to put the bars at 3 and 6 one slice early.
+        let window = IntradayWindow {
+            start_offset_ns: 0,
+            duration_ns: 10,
+            day_ns: 100,
+        };
+        let bars = [(2, 1), (3, 1), (5, 1), (6, 1), (9, 1)];
+        assert_eq!(
+            volume_profile_from_bars(&bars, window, 3).unwrap(),
+            vec![0.2, 0.4, 0.4]
+        );
+
+        for (duration_ns, num_slices) in [(10u64, 3usize), (7, 7), (100, 7), (1_000, 999)] {
+            for offset in 0..duration_ns {
+                let slice = slice_containing(offset, duration_ns, num_slices);
+                assert!(slice < num_slices);
+                assert!(slice_start(0, duration_ns, num_slices, slice) <= offset);
+                assert!(offset < slice_start(0, duration_ns, num_slices, slice + 1));
+            }
+        }
     }
 
     #[test]

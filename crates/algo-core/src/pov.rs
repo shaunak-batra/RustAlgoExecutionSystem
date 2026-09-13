@@ -34,7 +34,7 @@ pub struct PovSchedule {
 /// `market_volume` holds `(timestamp_ns, volume)` observations in time order,
 /// where `volume` is the volume that traded *since the observation before it*
 /// (an increment, not a running total) and `timestamp_ns` is when that volume
-/// became known — a bar's close, not its open.
+/// became known: a bar's close, not its open.
 ///
 /// Each child order is released at the timestamp of the observation that allowed
 /// it, so the schedule never reacts to an observation that appears later in the
@@ -43,9 +43,9 @@ pub struct PovSchedule {
 /// information (bar opens, for instance) would be look-ahead no matter what this
 /// function does. Offset the timestamps if a strictly later release is wanted.
 ///
-/// After each observation in
-/// `[start_ns, end_ns)` the cumulative target is
-/// `min(total_qty, ⌊cumulative volume × participation_bps / 10 000⌋)`, and a
+/// After each observation in `[start_ns, end_ns)` the cumulative target is
+/// `min(total_qty, ⌊V × participation_bps / 10 000⌋)`, where `V` is the volume
+/// of the observations so far inside the window, and a
 /// child order for any increase is released at that observation's timestamp.
 /// The arithmetic is exact integer arithmetic, so the cumulative scheduled
 /// quantity never exceeds the rate times cumulative volume.

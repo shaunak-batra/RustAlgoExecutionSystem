@@ -91,11 +91,12 @@ pub(crate) fn slice_start(start_ns: u64, duration_ns: u64, num_slices: usize, in
 ///
 /// Rounding the running total, rather than each slice independently, is what
 /// keeps the error from accumulating: prefix `k` lands within half a unit of
-/// `total as f64 * cumulative[k]`, plus the error of evaluating that product,
-/// which is nothing for totals below 2^53 and at most an ulp of `total` above
-/// it. Measured against an exact rational curve, add whatever error the
-/// caller's own `cumulative` values already carry — for a profile summed in
-/// `f64` that grows with the number of slices.
+/// the computed `total as f64 * cumulative[k]`, which is within about
+/// `f64::EPSILON * total` of the exact product (half an ulp from the
+/// multiplication, and above 2^53 another half ulp from converting `total`).
+/// Measured against an exact rational curve, add whatever error the caller's
+/// own `cumulative` values already carry; for a profile summed in `f64` that
+/// grows with the number of slices.
 ///
 /// Targets are also clamped to the running total, so a curve that dips gives
 /// that slice zero rather than a negative quantity.

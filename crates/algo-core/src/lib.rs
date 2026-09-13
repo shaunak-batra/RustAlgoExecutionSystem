@@ -10,9 +10,9 @@
 //! - [`is`]: implementation shortfall via the Almgren–Chriss optimal trajectory
 //!
 //! Every scheduler validates its input and returns a [`ScheduleError`] rather
-//! than panicking or silently returning an empty schedule. Quantities are
-//! integers that sum exactly to the order size (for POV, to what the observed
-//! volume allows).
+//! than panicking. Quantities are integers that sum exactly to the order size;
+//! a POV schedule sums to what the observed volume allows and reports the rest
+//! as its `shortfall_qty`.
 //!
 //! ## Example
 //!
