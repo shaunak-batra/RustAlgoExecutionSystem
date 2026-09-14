@@ -1,8 +1,9 @@
 """Generate the charts used in README.md.
 
-Every chart except the benchmark chart is computed from the real library through
-the Python bindings, so the figures stay in step with the code. The benchmark
-chart plots numbers measured with `cargo bench -p orderbook`.
+Every chart except the book walk and the benchmark chart is computed from the
+real library through the Python bindings, so the figures stay in step with the
+code. The book walk is arithmetic over a fixed, illustrative ladder of asks, and
+the benchmark chart plots numbers measured with `cargo bench -p orderbook`.
 
 Run from the repository root after installing the bindings:
 
@@ -268,7 +269,7 @@ def almgren_chriss_trajectories():
     ]
     right.loglog(grid, kappas, color=BLUE, linewidth=2.2, label="κ solved on the discrete grid")
     right.loglog(grid, np.sqrt(grid * SIGMA**2 / eta_tilde), color=ORANGE, linestyle="--",
-                 linewidth=1.6, label="continuous-time limit  √(λσ²/η̃)")
+                 linewidth=1.6, label="fine-slice approximation  √(λσ²/η̃)")
     right.set_title("κ follows √λ until the slice length binds")
     right.set_xlabel("risk aversion λ")
     right.set_ylabel("κ  (1 / second)")
@@ -413,9 +414,9 @@ def randomized_twap():
 def benchmarks():
     """Criterion results, measured with `cargo bench -p orderbook`."""
     rows = [
-        ("read best bid and best ask (1,000 levels)", 4.6),
-        ("insert + cancel a passive order (10 levels)", 69.5),
-        ("insert + cancel a passive order (1,000 levels)", 88.6),
+        ("read best bid and best ask (1,000 levels)", 4.8),
+        ("insert + cancel a passive order (10 levels)", 85.4),
+        ("insert + cancel a passive order (1,000 levels)", 96.1),
         ("IOC takes the best ask + refill (10 levels)", 131.9),
         ("IOC takes the best ask + refill (1,000 levels)", 152.9),
     ]
